@@ -45,6 +45,8 @@ export const TEXT = {
       eyebrow: "MyKVM 设置",
       title: "选择这台设备的工作模式",
       copy: "服务端负责发现并添加其它设备；客户端保持轻量运行，只接收服务端共享过来的鼠标和键盘。",
+      serverBadge: "主控",
+      clientBadge: "被控",
       serverTitle: "服务端",
       serverCopy: "进入完整工作台，添加局域网设备并管理显示器布局。",
       clientTitle: "客户端",
@@ -80,13 +82,24 @@ export const TEXT = {
       dragCrossingHoldUnit: "毫秒",
       fullscreenPause: "全屏应用自动暂停",
       fullscreenPauseCopy:
-        "前台出现全屏应用（如 FPS 游戏）时自动暂停边界切换、切屏快捷键和剪贴板同步，退出全屏后立即恢复。仅 Windows 生效。",
+        "没有配置下方应用名单时的兜底规则：前台出现任意全屏应用就暂停边界切换、切屏快捷键和剪贴板同步，退出全屏立即恢复。仅 Windows 生效。",
+      pauseWhitelist: "指定应用时暂停",
+      pauseWhitelistCopy:
+        "只在名单里的应用位于前台时暂停键鼠共享。名单一旦非空就完全接管暂停判定，上面的全屏规则自动让位，看全屏视频、浏览器全屏都不会再被误暂停。macOS 填 Bundle ID（如 com.valvesoftware.steam），Windows 填进程名（如 game.exe）。",
+      pauseWhitelistPlaceholder: "com.example.game 或 game.exe",
+      pauseWhitelistAdd: "添加",
+      pauseWhitelistEmpty: "名单为空，回退到上面的全屏规则。",
+      pauseWhitelistRemove: "移除",
+      pauseWhitelistDuplicate: "该应用已在名单中。",
       mouseSmoothing: "鼠标平滑",
       mouseSmoothingCopy:
         "对每次移动的位移做低通滤波，过滤采集与网络的微小抖动，远程光标更顺滑。",
       smoothScroll: "Mos 风格滚动",
       smoothScrollCopy:
-        "把一次滚轮刻度拆成一小串带缓动、按时间铺开的滚动事件，接收端像 Mos 一样平滑滚动。",
+        "把滚轮输入交给 Mos 同款的连续插值器：按像素逐帧补间并做曲线平滑，接收端滚动更跟手、无卡顿。",
+      reverseScroll: "反转滚动方向",
+      reverseScrollCopy:
+        "开启后内容跟随手指移动（macOS 的“自然滚动”）。当两台机器的滚动方向设置不一致时用它对齐。",
       appearanceTitle: "配置",
       language: "语言",
       simplifiedChinese: "cn 中文简体",
@@ -135,7 +148,7 @@ export const TEXT = {
       portPlaceholder: "1024-65535",
       activeDevice: "当前设备",
       clipboard: "剪贴板同步",
-      fileTransfer: "文件传输 (bate)",
+      fileTransfer: "文件传输 (beta)",
       fileTransferCopy:
         "将文件或文件夹拖到相邻屏幕即可跨设备传输，落在哪个设备上就送到哪台。",
       modifierTitle: "跨平台改键",
@@ -215,6 +228,7 @@ export const TEXT = {
       dismissingPairing: "正在关闭",
       listTitle: "设备列表",
       local: "本机",
+      unknownPlatform: "未知系统",
       lan: "局域网",
       manual: "手动",
       noScreens: "无屏幕信息",
@@ -289,6 +303,8 @@ export const TEXT = {
       eyebrow: "MyKVM setup",
       title: "Choose this device role",
       copy: "Server discovers and manages other devices; Client stays lightweight and receives shared mouse and keyboard input.",
+      serverBadge: "Controller",
+      clientBadge: "Controlled",
       serverTitle: "Server",
       serverCopy:
         "Open the full workspace, add LAN devices, and manage the display layout.",
@@ -326,13 +342,24 @@ export const TEXT = {
       dragCrossingHoldUnit: "ms",
       fullscreenPause: "Pause for fullscreen apps",
       fullscreenPauseCopy:
-        "While a fullscreen app (an FPS game, say) owns the foreground, edge crossings, switch hotkeys and clipboard sync are suspended, resuming the moment it leaves fullscreen. Windows only.",
+        "Fallback rule used only when the app list below is empty: any fullscreen app in the foreground suspends edge crossings, switch hotkeys and clipboard sync, resuming the moment it leaves fullscreen. Windows only.",
+      pauseWhitelist: "Pause for specific apps",
+      pauseWhitelistCopy:
+        "Pause sharing only while one of these apps owns the foreground. A non-empty list takes over the decision entirely — the fullscreen rule above steps aside, so fullscreen video and fullscreen browsers no longer trigger a false pause. Use a bundle id on macOS (com.valvesoftware.steam) or an executable name on Windows (game.exe).",
+      pauseWhitelistPlaceholder: "com.example.game or game.exe",
+      pauseWhitelistAdd: "Add",
+      pauseWhitelistEmpty: "No apps listed — falling back to the fullscreen rule above.",
+      pauseWhitelistRemove: "Remove",
+      pauseWhitelistDuplicate: "That app is already on the list.",
       mouseSmoothing: "Mouse smoothing",
       mouseSmoothingCopy:
         "Low-pass filters each movement delta so capture/network jitter never reaches the remote cursor.",
       smoothScroll: "Mos-style scroll",
       smoothScrollCopy:
-        "Spreads one wheel tick into a short burst of eased, time-spaced scroll events so the receiving side scrolls smoothly, Mos-style.",
+        "Runs wheel input through the same continuous interpolator Mos uses: pixel-precise, frame-by-frame tweening with curve smoothing, so the receiving side tracks your finger instead of stepping.",
+      reverseScroll: "Reverse scroll direction",
+      reverseScrollCopy:
+        "Content follows your finger, the way macOS \"natural scrolling\" does. Use it to line up two machines whose scroll directions disagree.",
       appearanceTitle: "Configuration",
       language: "Language",
       simplifiedChinese: "cn 中文简体",
@@ -381,7 +408,7 @@ export const TEXT = {
       portPlaceholder: "1024-65535",
       activeDevice: "Active Device",
       clipboard: "Clipboard Sync",
-      fileTransfer: "File Transfer (bate)",
+      fileTransfer: "File Transfer (beta)",
       fileTransferCopy:
         "Drag files or folders onto an adjacent screen to transfer them across devices — wherever they land is where they go.",
       modifierTitle: "Cross-platform Keys",
@@ -461,6 +488,7 @@ export const TEXT = {
       dismissingPairing: "Closing",
       listTitle: "Device List",
       local: "Local",
+      unknownPlatform: "Unknown",
       lan: "LAN",
       manual: "Manual",
       noScreens: "No screen data",
@@ -492,3 +520,22 @@ export const TEXT = {
 } as const;
 
 export type AppText = (typeof TEXT)[keyof typeof TEXT];
+
+/**
+ * Mirror of the language currently rendered by the UI.
+ *
+ * Some strings are produced outside a React render — promise `.catch()`
+ * handlers, one-shot effects, toast helpers — where the `ui` object is not in
+ * scope. Those used to reach for `TEXT.cn` directly, which meant English users
+ * were shown Chinese error text. `activeText()` gives them the same language
+ * the UI is actually rendering in.
+ */
+let activeLanguage: "cn" | "en" = "cn";
+
+export function setActiveLanguage(language: "cn" | "en") {
+  activeLanguage = language;
+}
+
+export function activeText(): AppText {
+  return TEXT[activeLanguage];
+}

@@ -99,4 +99,9 @@ export interface LayoutState {
   /** Spread a wheel tick into a short burst of eased scroll events for
    *  "Mos"-style smooth scrolling on the receiving side. */
   smoothScroll: boolean
+  /** Invert the wheel direction before it is injected on the receiving side. */
+  reverseScroll: boolean
+  /** Bundle ids (macOS) or executable names (Windows) that suspend sharing
+   *  while they own the foreground. Empty means "no app-specific pause". */
+  pauseAppWhitelist: string[]
 }

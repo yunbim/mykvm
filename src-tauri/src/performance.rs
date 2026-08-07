@@ -236,7 +236,15 @@ mod tests {
         let (cpu, memory_mb) = parse_process_metrics(" 2.5 115664\n").expect("metrics");
 
         assert_eq!(cpu, 2.5);
-        assert!((memory_mb - 112.953125).abs() < f64::EPSILON);
+        // `ps` reports RSS in KiB on Unix, so the parser converts; the Windows
+        // path already hands over MiB and must not divide again. Asserting the
+        // Unix number unconditionally made this test fail on Windows hosts.
+        let expected_mb = if cfg!(target_os = "windows") {
+            115664.0
+        } else {
+            112.953125
+        };
+        assert!((memory_mb - expected_mb).abs() < f64::EPSILON);
     }
 
     #[cfg(target_os = "macos")]

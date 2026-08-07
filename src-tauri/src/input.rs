@@ -1132,6 +1132,7 @@ fn start_platform_capture(
         // Watch for fullscreen apps taking over the foreground so sharing can
         // step aside for the duration.
         spawn_fullscreen_watcher(Arc::clone(&stop));
+        spawn_app_pause_watcher(Arc::clone(&stop));
         let mut message = MSG::default();
         let mut last_desktop_check = Instant::now() - Duration::from_millis(200);
         while !stop.load(Ordering::Relaxed) {
@@ -1447,6 +1448,7 @@ fn send_packet(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
+    let is_key_event = matches!(event, InputEvent::Key { .. });
     let mut packet_context = input_packet_context(target, event, layout_state);
     let Some(peer) = packet_context.peer.take() else {
         return false;
@@ -1497,16 +1499,26 @@ fn send_packet(
         }
     };
 
-    match quic_transport.send_datagram(peer, payload) {
-        Ok(()) => {
-            input_events.fetch_add(1, Ordering::Relaxed);
-            true
+    // #9: keyboard events go over a reliable QUIC *stream* (acknowledged) so
+    // keystrokes are never dropped — datagrams are best-effort and used to
+    // silently lose keys under load, and the brief "Connecting" window used to
+    // drop datagrams entirely. Mouse moves / scroll stay on datagrams
+    // (latest-wins, latency-critical). If the stream send fails for any reason
+    // we fall back to the datagram path so a key is still attempted.
+    let sent = if is_key_event {
+        match quic_transport.send_stream_expect_ack(peer.clone(), payload.clone()) {
+            Ok(()) => true,
+            Err(_) => quic_transport.send_datagram(peer, payload).is_ok(),
         }
-        Err(error) => {
-            mark_target_offline(layout_state, target, &error);
-            false
-        }
+    } else {
+        quic_transport.send_datagram(peer, payload).is_ok()
+    };
+    if sent {
+        input_events.fetch_add(1, Ordering::Relaxed);
+    } else {
+        mark_target_offline(layout_state, target, "input send failed");
     }
+    sent
 }
 
 pub fn send_secure_attention_control(
@@ -2632,12 +2644,295 @@ static NOTIFY_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 pub fn set_app_handle_for_notify(handle: AppHandle) {
     let _ = NOTIFY_APP_HANDLE.set(handle);
 }
+
+/// UI language mirror ("cn" | "en") so watcher threads can raise notifications
+/// in the language picked in Settings instead of hardcoded Chinese (#6).
+static NOTIFY_LANGUAGE: Mutex<String> = Mutex::new(String::new());
+
+/// Publishes the UI language to the watcher threads. Called whenever the layout
+/// (and therefore the language setting) is applied.
+pub fn set_notify_language(language: &str) {
+    if let Ok(mut lang) = NOTIFY_LANGUAGE.lock() {
+        lang.clear();
+        lang.push_str(if language == "en" { "en" } else { "cn" });
+    }
+}
+
+fn notify_language_is_en() -> bool {
+    NOTIFY_LANGUAGE
+        .lock()
+        .map(|lang| lang.as_str() == "en")
+        .unwrap_or(false)
+}
+
+/// Raises the "sharing paused / resumed" notification in the user's language.
+/// `whitelist` distinguishes the app-whitelist trigger (#8) from the broader
+/// fullscreen trigger so the copy tells the user *why* sharing stepped aside.
+#[allow(dead_code)]
+fn notify_sharing_pause(active: bool, whitelist: bool) {
+    let Some(app) = NOTIFY_APP_HANDLE.get() else {
+        return;
+    };
+    let en = notify_language_is_en();
+    let (title, body) = match (active, whitelist, en) {
+        (true, true, false) => (
+            "mykvm · 已暂停",
+            "名单中的应用已切到前台，键鼠共享已暂停，不影响你操作。",
+        ),
+        (true, true, true) => (
+            "mykvm · Paused",
+            "A whitelisted app is in the foreground — input sharing is paused.",
+        ),
+        (true, false, false) => (
+            "mykvm · 已暂停",
+            "检测到全屏应用，已暂停键鼠共享，不影响你操作。",
+        ),
+        (true, false, true) => (
+            "mykvm · Paused",
+            "A fullscreen app took the foreground — input sharing is paused.",
+        ),
+        (false, true, false) => ("mykvm · 已恢复", "名单中的应用已离开前台，键鼠共享已恢复。"),
+        (false, true, true) => (
+            "mykvm · Resumed",
+            "The whitelisted app left the foreground — input sharing is back.",
+        ),
+        (false, false, false) => ("mykvm · 已恢复", "全屏应用已退出，键鼠共享已自动恢复。"),
+        (false, false, true) => (
+            "mykvm · Resumed",
+            "The fullscreen app exited — input sharing is back.",
+        ),
+    };
+    if let Err(error) = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+    {
+        log::warn!("pause notification failed: {error}");
+    }
+}
 /// How often the watcher samples the foreground window.
 #[cfg(target_os = "windows")]
 const FULLSCREEN_POLL_INTERVAL_MS: u64 = 600;
 
 pub fn fullscreen_app_active() -> bool {
     FULLSCREEN_APP_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Set while a whitelisted app (e.g. a game) owns the foreground. Read on the
+/// input hot path alongside `FULLSCREEN_APP_ACTIVE` so a pause-whitelist match
+/// halts sharing exactly like a fullscreen app does.
+static APP_PAUSE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Whitelisted app identifiers (macOS bundle id / Windows exe name, lowercased
+/// on store) that pause input sharing when they take the foreground.
+static PAUSE_WHITELIST: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub fn app_pause_active() -> bool {
+    APP_PAUSE_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Publishes the pause whitelist (bundle ids / exe names). Stored lowercased so
+/// the foreground-app comparison is case-insensitive.
+pub fn set_pause_whitelist(list: Vec<String>) {
+    if let Ok(mut wl) = PAUSE_WHITELIST.lock() {
+        *wl = list.into_iter().map(|s| s.to_lowercase()).collect();
+    }
+}
+
+fn whitelist_contains(id: &str) -> bool {
+    match PAUSE_WHITELIST.lock() {
+        Ok(wl) => wl.iter().any(|w| w == &id.to_lowercase()),
+        Err(_) => false,
+    }
+}
+
+/// True once the user has curated at least one app to pause for.
+pub fn pause_whitelist_configured() -> bool {
+    PAUSE_WHITELIST
+        .lock()
+        .map(|wl| !wl.is_empty())
+        .unwrap_or(false)
+}
+
+/// Single decision point for "should input sharing stand aside right now?".
+///
+/// A configured whitelist wins outright (#8): it is the precise, user-curated
+/// signal, so once it exists the broad "any fullscreen window" heuristic is no
+/// longer consulted — a fullscreen video or a maximised browser must not steal
+/// the pointer back. With an empty whitelist the fullscreen heuristic remains
+/// as the zero-configuration fallback.
+pub fn scene_pause_active() -> bool {
+    if pause_whitelist_configured() {
+        app_pause_active()
+    } else {
+        fullscreen_app_active()
+    }
+}
+
+/// Polls the foreground app and pauses input sharing when it matches the
+/// user's pause whitelist (e.g. a game). Whitelist pause is the primary trigger
+/// (#8); the existing fullscreen watcher stays for the "any fullscreen" trigger.
+pub fn spawn_app_pause_watcher(stop: Arc<AtomicBool>) {
+    #[cfg(target_os = "macos")]
+    spawn_macos_app_pause_watcher(stop);
+    #[cfg(target_os = "windows")]
+    spawn_windows_app_pause_watcher(stop);
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_macos_app_pause_watcher(stop: Arc<AtomicBool>) {
+    use std::time::Duration;
+
+    std::thread::spawn(move || {
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let active = match unsafe { macos_frontmost_bundle_id() } {
+                Some(id) => whitelist_contains(&id),
+                None => false,
+            };
+            let previous = APP_PAUSE_ACTIVE.swap(active, Ordering::Relaxed);
+            if previous != active {
+                log::info!(
+                    "pause-whitelist app {} — input sharing {}",
+                    if active { "matched" } else { "left" },
+                    if active { "paused" } else { "resumed" }
+                );
+                notify_sharing_pause(active, true);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        APP_PAUSE_ACTIVE.store(false, Ordering::Relaxed);
+    });
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn macos_frontmost_bundle_id() -> Option<String> {
+    use std::ffi::{c_void, CStr};
+    use std::os::raw::c_char;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    let cls = objc_getClass(b"NSWorkspace\0".as_ptr() as *const c_char);
+    if cls.is_null() {
+        return None;
+    }
+    let shared = sel_registerName(b"sharedWorkspace\0".as_ptr() as *const c_char);
+    let msg: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        std::mem::transmute(objc_msgSend as *const ());
+    let ws = msg(cls, shared);
+    if ws.is_null() {
+        return None;
+    }
+    let front = sel_registerName(b"frontmostApplication\0".as_ptr() as *const c_char);
+    let app = msg(ws, front);
+    if app.is_null() {
+        return None;
+    }
+    let bid_sel = sel_registerName(b"bundleIdentifier\0".as_ptr() as *const c_char);
+    let bid_ns: *mut c_void = msg(app, bid_sel);
+    if bid_ns.is_null() {
+        return None;
+    }
+    let utf8 = sel_registerName(b"UTF8String\0".as_ptr() as *const c_char);
+    let cstr: extern "C" fn(*mut c_void, *mut c_void) -> *const c_char =
+        std::mem::transmute(objc_msgSend as *const ());
+    let ptr = cstr(bid_ns, utf8);
+    if ptr.is_null() {
+        return None;
+    }
+    Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_windows_app_pause_watcher(stop: Arc<AtomicBool>) {
+    use std::time::Duration;
+
+    std::thread::spawn(move || {
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let active = match windows_foreground_exe_name() {
+                Some(name) => whitelist_contains(&name),
+                None => false,
+            };
+            let previous = APP_PAUSE_ACTIVE.swap(active, Ordering::Relaxed);
+            if previous != active {
+                log::info!(
+                    "pause-whitelist app {} — input sharing {}",
+                    if active { "matched" } else { "left" },
+                    if active { "paused" } else { "resumed" }
+                );
+                // Never strand the pointer on the remote when a game takes over.
+                if active {
+                    if let Some(context) = windows_capture_context() {
+                        release_windows_remote_control(&context, false);
+                    }
+                }
+                notify_sharing_pause(active, true);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        APP_PAUSE_ACTIVE.store(false, Ordering::Relaxed);
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn windows_foreground_exe_name() -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, HWND};
+    use windows_sys::Win32::System::ProcessStatus::GetModuleFileNameExW;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+
+    let hwnd: HWND = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return None;
+    }
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if pid == 0 {
+        return None;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let len = unsafe {
+        GetModuleFileNameExW(
+            handle,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    if len == 0 {
+        return None;
+    }
+    let name = std::ffi::OsString::from_wide(&buf[..len as usize])
+        .to_string_lossy()
+        .into_owned();
+    Some(
+        name.rsplit('\\')
+            .next()
+            .unwrap_or("")
+            .to_string()
+            .to_lowercase(),
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -2720,9 +3015,12 @@ fn detect_windows_fullscreen_app() -> bool {
 fn spawn_fullscreen_watcher(stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
-            if !FULLSCREEN_PAUSE_ENABLED.load(Ordering::Relaxed) {
+            // The whitelist, once configured, supersedes this heuristic (#8).
+            // Stay silent rather than raising "fullscreen detected" notices for
+            // a pause that `scene_pause_active` will not honour anyway.
+            if !FULLSCREEN_PAUSE_ENABLED.load(Ordering::Relaxed) || pause_whitelist_configured() {
                 if FULLSCREEN_APP_ACTIVE.swap(false, Ordering::Relaxed) {
-                    log::info!("fullscreen pause disabled — input sharing resumed");
+                    log::info!("fullscreen pause inactive — input sharing resumed");
                 }
                 std::thread::sleep(Duration::from_millis(FULLSCREEN_POLL_INTERVAL_MS));
                 continue;
@@ -2743,28 +3041,7 @@ fn spawn_fullscreen_watcher(stop: Arc<AtomicBool>) {
                 }
                 // Surface the pause/resume as a native notification so the user
                 // knows sharing stepped aside for their game and came back.
-                if let Some(app) = NOTIFY_APP_HANDLE.get() {
-                    let (title, body) = if active {
-                        (
-                            "mykvm · 已暂停",
-                            "检测到全屏应用，已暂停键鼠共享，不影响你操作。",
-                        )
-                    } else {
-                        (
-                            "mykvm · 已恢复",
-                            "全屏应用已退出，键鼠共享已自动恢复。",
-                        )
-                    };
-                    if let Err(error) = app
-                        .notification()
-                        .builder()
-                        .title(title)
-                        .body(body)
-                        .show()
-                    {
-                        log::warn!("fullscreen notification failed: {error}");
-                    }
-                }
+                notify_sharing_pause(active, false);
             }
             std::thread::sleep(Duration::from_millis(FULLSCREEN_POLL_INTERVAL_MS));
         }
@@ -2869,11 +3146,15 @@ pub fn set_scene_guard_settings(drag_guard: bool, drag_hold_ms: u64, fullscreen_
 // receiving side. Both mirror `LayoutState` so the setting is live.
 static MOUSE_SMOOTHING: AtomicBool = AtomicBool::new(true);
 static SMOOTH_SCROLL: AtomicBool = AtomicBool::new(true);
+/// Natural-scroll reversal (Mos-style "reverse scroll"). Negates wheel deltas
+/// so the content tracks the finger like a touchscreen. Mirrors `LayoutState`.
+static REVERSE_SCROLL: AtomicBool = AtomicBool::new(false);
 
 /// Publishes the input-smoothing settings to the capture/inject hot paths.
-pub fn set_input_smoothing(mouse: bool, scroll: bool) {
+pub fn set_input_smoothing(mouse: bool, scroll: bool, reverse: bool) {
     MOUSE_SMOOTHING.store(mouse, Ordering::Relaxed);
     SMOOTH_SCROLL.store(scroll, Ordering::Relaxed);
+    REVERSE_SCROLL.store(reverse, Ordering::Relaxed);
 }
 
 /// Exponential moving average over the movement delta. `alpha` near 1 tracks
@@ -2897,22 +3178,30 @@ fn smooth_mouse_delta(dx: f64, dy: f64) -> (f64, f64) {
     (smoothed_x, smoothed_y)
 }
 
-/// Receiving-side scroll injection. When smooth scrolling is enabled the tick
-/// is handed to the smoother (time-spaced eased burst); otherwise it is posted
-/// directly. The platform-specific post lives in `post_raw_scroll`.
+/// Receiving-side scroll injection. `delta_x` / `delta_y` are **wheel notches
+/// (lines)** — both senders normalise to ±1 per physical detent (Windows
+/// divides `mouseData` by `WHEEL_DELTA`, macOS reads the line-delta field).
+/// When smooth scrolling is enabled the notch is handed to the Mos-style
+/// smoother, which converts it into a pixel budget and drains it over many
+/// frames; otherwise it is posted as a plain line scroll. Reverse scrolling is
+/// applied here so it works on both platforms and for both paths.
 pub(crate) fn inject_scroll(delta_x: i32, delta_y: i32) {
+    let (delta_x, delta_y) = if REVERSE_SCROLL.load(Ordering::Relaxed) {
+        (-delta_x, -delta_y)
+    } else {
+        (delta_x, delta_y)
+    };
     if SMOOTH_SCROLL.load(Ordering::Relaxed) {
         scroll_smoothing::enqueue(delta_x, delta_y);
     } else {
-        post_raw_scroll(delta_x, delta_y);
+        post_line_scroll(delta_x, delta_y);
     }
 }
 
-/// Platform-specific scroll post. The macOS / Windows bodies mirror the old
-/// per-platform `inject_scroll`; `inject_scroll` (above) is now the shared,
-/// smoothing-aware entry point.
+/// Unsmoothed post: one wire notch becomes one native notch/line so the remote
+/// feels exactly like the local wheel.
 #[cfg(target_os = "macos")]
-fn post_raw_scroll(delta_x: i32, delta_y: i32) {
+fn post_line_scroll(delta_x: i32, delta_y: i32) {
     use core_graphics::{
         event::{CGEvent, CGEventTapLocation, ScrollEventUnit},
         event_source::{CGEventSource, CGEventSourceStateID},
@@ -2921,6 +3210,8 @@ fn post_raw_scroll(delta_x: i32, delta_y: i32) {
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         return;
     };
+    // LINE (not PIXEL): the payload is a notch count, so posting it as pixels
+    // would scroll a single pixel per detent. axis1 = vertical, axis2 = horizontal.
     if let Ok(event) =
         CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)
     {
@@ -2929,59 +3220,267 @@ fn post_raw_scroll(delta_x: i32, delta_y: i32) {
 }
 
 #[cfg(target_os = "windows")]
-fn post_raw_scroll(delta_x: i32, delta_y: i32) {
+fn post_line_scroll(delta_x: i32, delta_y: i32) {
     crate::windows_input::inject_scroll(delta_x, delta_y);
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn post_raw_scroll(_delta_x: i32, _delta_y: i32) {}
+fn post_line_scroll(_delta_x: i32, _delta_y: i32) {}
 
-/// Spreads one wheel tick into a burst of eased, time-spaced increments so the
-/// receiving OS animates the scroll instead of jumping a whole notch.
+/// Smoothed post. The smoother works in a **pixel** domain (Mos' native unit),
+/// but every OS scroll API takes an integer payload, so the fractional
+/// remainder is carried across frames. Without the carry each frame would lose
+/// up to half a unit to rounding and a smoothed notch would visibly travel a
+/// shorter distance than an unsmoothed one — the core reason the previous
+/// implementation felt wrong. `flush` drains the carry when a scroll session
+/// ends so the totals line up.
+fn post_pixel_scroll(px_x: f64, px_y: f64, flush: bool) {
+    static CARRY_X: Mutex<f64> = Mutex::new(0.0);
+    static CARRY_Y: Mutex<f64> = Mutex::new(0.0);
+
+    let (unit_x, unit_y) = pixels_to_post_units(px_x, px_y);
+    let (out_x, out_y) = {
+        let mut carry_x = CARRY_X.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut carry_y = CARRY_Y.lock().unwrap_or_else(|poison| poison.into_inner());
+        *carry_x += unit_x;
+        *carry_y += unit_y;
+        let (out_x, out_y) = if flush {
+            (carry_x.round(), carry_y.round())
+        } else {
+            (carry_x.trunc(), carry_y.trunc())
+        };
+        *carry_x -= out_x;
+        *carry_y -= out_y;
+        if flush {
+            *carry_x = 0.0;
+            *carry_y = 0.0;
+        }
+        (out_x as i32, out_y as i32)
+    };
+    if out_x != 0 || out_y != 0 {
+        post_smoothed_units(out_x, out_y);
+    }
+}
+
+/// Converts the smoother's pixel output into the unit the platform post below
+/// expects. macOS consumes pixels directly; Windows' `mouseData` is in
+/// `WHEEL_DELTA` (120) units, so one notch worth of pixels must map back to
+/// exactly 120 — otherwise smoothing would silently rescale the scroll speed.
+#[cfg(target_os = "windows")]
+fn pixels_to_post_units(px_x: f64, px_y: f64) -> (f64, f64) {
+    const WHEEL_DELTA: f64 = 120.0;
+    let scale = WHEEL_DELTA / scroll_smoothing::PIXELS_PER_NOTCH;
+    (px_x * scale, px_y * scale)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn pixels_to_post_units(px_x: f64, px_y: f64) -> (f64, f64) {
+    (px_x, px_y)
+}
+
+#[cfg(target_os = "macos")]
+fn post_smoothed_units(delta_x: i32, delta_y: i32) {
+    use core_graphics::{
+        event::{CGEvent, CGEventTapLocation, EventField, ScrollEventUnit},
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
+
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        return;
+    };
+    // Mos posts pixel deltas with `isContinuous = 1` so macOS animates the
+    // scroll (and rubber-bands at document edges) instead of snapping a notch.
+    if let Ok(event) =
+        CGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 2, delta_y, delta_x, 0)
+    {
+        event.set_integer_value_field(EventField::ScrollWheelEventIsContinuous, 1);
+        event.post(CGEventTapLocation::HID);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn post_smoothed_units(delta_x: i32, delta_y: i32) {
+    crate::windows_input::inject_scroll_units(delta_x, delta_y);
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn post_smoothed_units(_delta_x: i32, _delta_y: i32) {}
+
+/// Mos-style smooth scrolling (port of `ScrollCore` / `ScrollPoster` /
+/// `ScrollFilter`).
+///
+/// A wire notch is first converted into a **pixel budget** (`step * speed`,
+/// Mos' defaults) and accumulated into `buffer`. A worker thread then drains
+/// `current` toward `buffer` once per frame with a linear interpolation
+/// (`current += (buffer - current) * trans`), passes the per-frame delta
+/// through Mos' curve filter, and posts the result.
+///
+/// Three properties matter and are each covered by a test below:
+///
+/// 1. **Distance is preserved.** `Σ posted == buffer`. The lerp never reaches
+///    its target and the filter lags by design, so the session is explicitly
+///    *flushed* (residual + filter window emitted in one final frame) once it
+///    converges. The integer rounding at the platform boundary is handled by a
+///    fractional carry in `post_pixel_scroll`.
+/// 2. **Speed is unchanged.** One notch travels `step * speed` pixels whether
+///    or not smoothing is on, on both platforms.
+/// 3. **No idle spin.** The worker parks on a condvar between sessions instead
+///    of waking 125×/s forever.
 mod scroll_smoothing {
-    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    const STEP: f64 = 8.0;
-    const MAX_STEPS: usize = 24;
-    const INTERVAL_MS: u64 = 8;
+    /// Mos defaults (`Options` / `Constants.swift`). `durationTransition` 4.35
+    /// maps to a per-frame lerp factor of ~0.085.
+    const TRANS: f64 = 0.085;
+    const STEP: f64 = 33.6;
+    const SPEED: f64 = 2.70;
+    /// Pixels one wheel notch is worth. Mos clamps the raw macOS pixel delta
+    /// (~10px/notch) up to `step` before applying `speed`, so a detent ends up
+    /// scrolling `step * speed` ≈ 90.7px — reproduced here directly because our
+    /// wire unit is already a notch count.
+    pub(super) const PIXELS_PER_NOTCH: f64 = STEP * SPEED;
+    /// Mos `ScrollFilter.polish` blends 23% of the new frame into the window.
+    const FILTER_ALPHA: f64 = 0.23;
+    /// Residual (px) at which an idle session is flushed and the worker parked.
+    const SETTLE_PX: f64 = 0.5;
+    /// ~120Hz, matching Mos' CVDisplayLink cadence.
+    const INTERVAL: Duration = Duration::from_millis(8);
+    /// How long after the last wheel tick the session counts as "released".
+    const MANUAL_END: Duration = Duration::from_millis(180);
 
-    static QUEUE: OnceLock<Mutex<VecDeque<(i32, i32)>>> = OnceLock::new();
+    pub(super) struct State {
+        current: (f64, f64),
+        buffer: (f64, f64),
+        delta: (f64, f64),
+        window: (f64, f64),
+        last_input: Instant,
+        active: bool,
+    }
+
+    impl State {
+        fn new() -> Self {
+            State {
+                current: (0.0, 0.0),
+                buffer: (0.0, 0.0),
+                delta: (0.0, 0.0),
+                window: (0.0, 0.0),
+                last_input: Instant::now(),
+                active: false,
+            }
+        }
+
+        fn reset(&mut self) {
+            self.current = (0.0, 0.0);
+            self.buffer = (0.0, 0.0);
+            self.delta = (0.0, 0.0);
+            self.window = (0.0, 0.0);
+            self.active = false;
+        }
+    }
+
+    static PARK: OnceLock<(Mutex<State>, Condvar)> = OnceLock::new();
     static WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+
+    fn park() -> &'static (Mutex<State>, Condvar) {
+        PARK.get_or_init(|| (Mutex::new(State::new()), Condvar::new()))
+    }
+
+    fn lock() -> MutexGuard<'static, State> {
+        park().0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Converts a wire notch count into Mos' pixel domain. Mos normalises a
+    /// sub-`step` tick up to a full `step` so a tiny notch still moves; with an
+    /// integer notch count that reduces to `|n| >= 1`, kept explicit so the
+    /// intent survives if the wire ever carries fractional ticks.
+    fn notches_to_pixels(notches: f64) -> f64 {
+        if notches == 0.0 {
+            return 0.0;
+        }
+        notches.signum() * notches.abs().max(1.0) * PIXELS_PER_NOTCH
+    }
+
+    /// Mos `ScrollFilter.polish`: a one-pole blend read one frame late, which
+    /// rounds off the start/stop jitter of the raw lerp. It is sum-preserving —
+    /// `Σ out == Σ frame - window_final` — and `advance` emits `window_final`
+    /// in the flush frame so nothing is lost.
+    fn polish(window: &mut f64, next: f64) -> f64 {
+        let out = *window;
+        *window += FILTER_ALPHA * (next - *window);
+        out
+    }
 
     pub fn enqueue(delta_x: i32, delta_y: i32) {
         if delta_x == 0 && delta_y == 0 {
             return;
         }
-        let magnitude = (delta_y.unsigned_abs().max(delta_x.unsigned_abs())) as f64;
-        let steps = (magnitude / STEP).clamp(1.0, MAX_STEPS as f64).round() as usize;
+        // axis mapping: incoming delta_y is vertical (axis1), delta_x horizontal (axis2)
+        let px = (
+            notches_to_pixels(delta_y as f64),
+            notches_to_pixels(delta_x as f64),
+        );
         {
-            let queue = QUEUE.get_or_init(|| Mutex::new(VecDeque::new()));
-            let mut queue = match queue.lock() {
-                Ok(queue) => queue,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let mut acc_x = 0i32;
-            let mut acc_y = 0i32;
-            for index in 1..=steps {
-                let t = index as f64 / steps as f64;
-                // Ease-out: most of the travel happens early, then it settles.
-                let eased = 1.0 - (1.0 - t) * (1.0 - t);
-                let target_x = (delta_x as f64 * eased).round() as i32;
-                let target_y = (delta_y as f64 * eased).round() as i32;
-                let step_x = target_x - acc_x;
-                let step_y = target_y - acc_y;
-                acc_x = target_x;
-                acc_y = target_y;
-                if step_x != 0 || step_y != 0 {
-                    queue.push_back((step_x, step_y));
-                }
-            }
+            let mut s = lock();
+            push(&mut s, px);
+            s.last_input = Instant::now();
         }
+        park().1.notify_all();
         ensure_worker();
+    }
+
+    /// Mos `ScrollPoster.update()`: ticks in the same direction extend the
+    /// current session's target, a direction reversal restarts it so the
+    /// remaining momentum of the old direction is dropped immediately.
+    pub(super) fn push(s: &mut State, px: (f64, f64)) {
+        if px.0 * s.delta.0 > 0.0 {
+            s.buffer.0 += px.0;
+        } else if px.0 != 0.0 {
+            s.buffer.0 = px.0;
+            s.current.0 = 0.0;
+        }
+        if px.1 * s.delta.1 > 0.0 {
+            s.buffer.1 += px.1;
+        } else if px.1 != 0.0 {
+            s.buffer.1 = px.1;
+            s.current.1 = 0.0;
+        }
+        if px.0 != 0.0 {
+            s.delta.0 = px.0;
+        }
+        if px.1 != 0.0 {
+            s.delta.1 = px.1;
+        }
+        s.active = true;
+    }
+
+    /// One interpolation frame. Returns `(out_x, out_y, finished)` in pixels;
+    /// `finished` marks the flush frame that ends the session.
+    pub(super) fn advance(s: &mut State, idle: bool) -> (f64, f64, bool) {
+        let frame_y = (s.buffer.0 - s.current.0) * TRANS;
+        let frame_x = (s.buffer.1 - s.current.1) * TRANS;
+        s.current.0 += frame_y;
+        s.current.1 += frame_x;
+        let mut out_y = polish(&mut s.window.0, frame_y);
+        let mut out_x = polish(&mut s.window.1, frame_x);
+
+        let residual_y = s.buffer.0 - s.current.0;
+        let residual_x = s.buffer.1 - s.current.1;
+        let converged = residual_y.abs() <= SETTLE_PX && residual_x.abs() <= SETTLE_PX;
+        if idle && converged {
+            // Emit everything the lerp and the filter still owe, in one frame,
+            // so the smoothed distance equals the raw distance exactly. The
+            // filter's outstanding debt is `window / alpha`, not `window`:
+            // summing `w_n = w_{n-1} + alpha * (f_n - w_{n-1})` telescopes to
+            // `Σ out = Σ frame - w_final / alpha`.
+            out_y += residual_y + s.window.0 / FILTER_ALPHA;
+            out_x += residual_x + s.window.1 / FILTER_ALPHA;
+            s.reset();
+            return (out_x, out_y, true);
+        }
+        (out_x, out_y, false)
     }
 
     fn ensure_worker() {
@@ -2989,18 +3488,124 @@ mod scroll_smoothing {
             return;
         }
         thread::spawn(|| loop {
-            let next = QUEUE
-                .get()
-                .and_then(|queue| queue.lock().ok())
-                .and_then(|mut queue| queue.pop_front());
-            match next {
-                Some((delta_x, delta_y)) => {
-                    super::post_raw_scroll(delta_x, delta_y);
-                    thread::sleep(Duration::from_millis(INTERVAL_MS));
+            {
+                let (mutex, signal) = park();
+                let mut guard = mutex.lock().unwrap_or_else(|poison| poison.into_inner());
+                while !guard.active {
+                    guard = signal
+                        .wait(guard)
+                        .unwrap_or_else(|poison| poison.into_inner());
                 }
-                None => thread::sleep(Duration::from_millis(16)),
+            }
+            thread::sleep(INTERVAL);
+            let (out_x, out_y, finished) = {
+                let mut s = lock();
+                if !s.active {
+                    continue;
+                }
+                let idle = s.last_input.elapsed() > MANUAL_END;
+                advance(&mut s, idle)
+            };
+            if out_x != 0.0 || out_y != 0.0 || finished {
+                super::post_pixel_scroll(out_x, out_y, finished);
             }
         });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn drain(ticks: &[(i32, i32)]) -> (f64, f64, usize) {
+            let mut s = State::new();
+            for &(dx, dy) in ticks {
+                push(
+                    &mut s,
+                    (notches_to_pixels(dy as f64), notches_to_pixels(dx as f64)),
+                );
+            }
+            let (mut total_y, mut total_x) = (0.0, 0.0);
+            let mut frames = 0usize;
+            // `idle = true` mirrors "user released the wheel": the session may
+            // settle as soon as it converges.
+            loop {
+                let (out_x, out_y, finished) = advance(&mut s, true);
+                total_x += out_x;
+                total_y += out_y;
+                frames += 1;
+                if finished || frames > 10_000 {
+                    break;
+                }
+            }
+            (total_x, total_y, frames)
+        }
+
+        #[test]
+        fn one_notch_is_worth_step_times_speed_pixels() {
+            assert!((notches_to_pixels(1.0) - 33.6 * 2.70).abs() < 1e-9);
+            assert!((notches_to_pixels(-1.0) + 33.6 * 2.70).abs() < 1e-9);
+            assert_eq!(notches_to_pixels(0.0), 0.0);
+        }
+
+        #[test]
+        fn smoothing_preserves_total_scroll_distance() {
+            let (total_x, total_y, frames) = drain(&[(0, 3)]);
+            assert!(
+                (total_y - 3.0 * PIXELS_PER_NOTCH).abs() < 1e-6,
+                "vertical distance drifted: {total_y}"
+            );
+            assert!(total_x.abs() < 1e-9, "horizontal axis leaked: {total_x}");
+            // Must actually be spread over many frames, not dumped at once.
+            assert!(frames > 20, "scroll was not smoothed: {frames} frames");
+        }
+
+        #[test]
+        fn smoothing_preserves_distance_on_both_axes() {
+            let (total_x, total_y, _) = drain(&[(-2, 5)]);
+            assert!((total_y - 5.0 * PIXELS_PER_NOTCH).abs() < 1e-6);
+            assert!((total_x + 2.0 * PIXELS_PER_NOTCH).abs() < 1e-6);
+        }
+
+        #[test]
+        fn direction_reversal_restarts_the_session() {
+            let mut s = State::new();
+            push(&mut s, (notches_to_pixels(1.0), 0.0));
+            for _ in 0..5 {
+                advance(&mut s, false);
+            }
+            push(&mut s, (notches_to_pixels(-1.0), 0.0));
+            // The reversal drops the leftover downward momentum instead of
+            // subtracting from it, so the new target is a clean single notch up.
+            assert!((s.buffer.0 + PIXELS_PER_NOTCH).abs() < 1e-9);
+            assert_eq!(s.current.0, 0.0);
+        }
+
+        #[test]
+        fn session_parks_after_settling() {
+            let mut s = State::new();
+            push(&mut s, (notches_to_pixels(1.0), 0.0));
+            let mut frames = 0;
+            while frames < 10_000 {
+                let (_, _, finished) = advance(&mut s, true);
+                frames += 1;
+                if finished {
+                    break;
+                }
+            }
+            assert!(frames < 10_000, "session never converged");
+            assert!(!s.active, "worker would keep spinning after settling");
+        }
+
+        #[test]
+        fn held_wheel_never_settles_until_released() {
+            let mut s = State::new();
+            push(&mut s, (notches_to_pixels(1.0), 0.0));
+            for _ in 0..500 {
+                let (_, _, finished) = advance(&mut s, false);
+                assert!(!finished, "settled while the wheel was still turning");
+            }
+            assert!(s.active);
+        }
     }
 }
 
@@ -3615,9 +4220,9 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         *last_point = Some((x, y));
     }
 
-    // A fullscreen app (typically a game) owns the screen: never pull the
-    // pointer away from it.
-    if fullscreen_app_active() {
+    // A paused-scene app (a whitelisted game, or any fullscreen window when no
+    // whitelist is configured) owns the screen: never pull the pointer away.
+    if scene_pause_active() {
         return false;
     }
 
@@ -4909,10 +5514,10 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
         Err(_) => return,
     };
     let Some(direction) = direction else { return };
-    // Fullscreen app in front: swallow the request rather than queueing it, so
-    // a stray hotkey during a game does not fire the moment the game exits.
-    if fullscreen_app_active() {
-        log::debug!("screen switch {direction:?} ignored: fullscreen app active");
+    // Paused scene in front: swallow the request rather than queueing it, so a
+    // stray hotkey during a game does not fire the moment the game exits.
+    if scene_pause_active() {
+        log::debug!("screen switch {direction:?} ignored: scene pause active");
         return;
     }
     let current_point = windows_current_cursor_point();
@@ -6146,6 +6751,16 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
 
     let _ = CGDisplay::warp_mouse_cursor_position(point);
 
+    // #3: a native click anywhere in another app's window transfers focus to
+    // that app — even when you click the middle, not the title bar. The
+    // synthetic press we inject does not do this on its own, so on button-down
+    // we activate the app whose window is under the cursor (hit-tested via the
+    // on-screen window list). Without this, clicking a non-titlebar region of
+    // another window leaves focus on the previously-active app.
+    if down {
+        macos_activate_app_at_point(x, y);
+    }
+
     if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
         if let Some(number) = button_number {
             event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
@@ -6155,6 +6770,281 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
             macos_click_state(button, down, x, y),
         );
         event.post(CGEventTapLocation::HID);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3 — synthetic clicks must transfer focus like native ones
+//
+// A real click anywhere inside another app's window activates that app, even
+// when you hit the middle of the content instead of the title bar. A CGEvent we
+// post ourselves does not: the window server delivers it to whichever app is
+// already frontmost. The fix is to hit-test the on-screen window list at the
+// click point, find the owning process and activate it *before* the button-down
+// is posted, which is exactly what AppKit does internally.
+//
+// Raw CoreFoundation C entry points are used deliberately instead of the
+// `core-foundation` wrapper types: this file is cross-compiled from a Windows
+// host for the Mac build, so the fewer generic inference sites the better.
+// ---------------------------------------------------------------------------
+
+/// `kCFStringEncodingUTF8`.
+#[cfg(target_os = "macos")]
+const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+/// `kCFNumberDoubleType` / `kCFNumberSInt32Type` from CFNumber.h.
+#[cfg(target_os = "macos")]
+const CF_NUMBER_DOUBLE: i32 = 13;
+#[cfg(target_os = "macos")]
+const CF_NUMBER_SINT32: i32 = 3;
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFArrayGetCount(array: *const std::ffi::c_void) -> isize;
+    fn CFArrayGetValueAtIndex(
+        array: *const std::ffi::c_void,
+        index: isize,
+    ) -> *const std::ffi::c_void;
+    fn CFDictionaryGetValue(
+        dict: *const std::ffi::c_void,
+        key: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    fn CFStringCreateWithCString(
+        alloc: *const std::ffi::c_void,
+        c_str: *const std::os::raw::c_char,
+        encoding: u32,
+    ) -> *const std::ffi::c_void;
+    fn CFNumberGetValue(
+        number: *const std::ffi::c_void,
+        the_type: i32,
+        value_ptr: *mut std::ffi::c_void,
+    ) -> u8;
+    fn CFRelease(cf: *const std::ffi::c_void);
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGWindowListCopyWindowInfo(
+        option: u32,
+        relative_to_window: u32,
+    ) -> *const std::ffi::c_void;
+}
+
+/// Reads a `CFNumber` stored under `key` as `f64`. Returns `None` when the key
+/// is missing or holds something else.
+#[cfg(target_os = "macos")]
+unsafe fn cf_dict_f64(dict: *const std::ffi::c_void, key: &[u8]) -> Option<f64> {
+    let cf_key = CFStringCreateWithCString(
+        std::ptr::null(),
+        key.as_ptr() as *const std::os::raw::c_char,
+        CF_STRING_ENCODING_UTF8,
+    );
+    if cf_key.is_null() {
+        return None;
+    }
+    let value = CFDictionaryGetValue(dict, cf_key);
+    CFRelease(cf_key);
+    if value.is_null() {
+        return None;
+    }
+    let mut out: f64 = 0.0;
+    let ok = CFNumberGetValue(
+        value,
+        CF_NUMBER_DOUBLE,
+        &mut out as *mut f64 as *mut std::ffi::c_void,
+    );
+    (ok != 0).then_some(out)
+}
+
+/// Reads a `CFNumber` stored under `key` as `i32` (pids and window layers).
+#[cfg(target_os = "macos")]
+unsafe fn cf_dict_i32(dict: *const std::ffi::c_void, key: &[u8]) -> Option<i32> {
+    let cf_key = CFStringCreateWithCString(
+        std::ptr::null(),
+        key.as_ptr() as *const std::os::raw::c_char,
+        CF_STRING_ENCODING_UTF8,
+    );
+    if cf_key.is_null() {
+        return None;
+    }
+    let value = CFDictionaryGetValue(dict, cf_key);
+    CFRelease(cf_key);
+    if value.is_null() {
+        return None;
+    }
+    let mut out: i32 = 0;
+    let ok = CFNumberGetValue(
+        value,
+        CF_NUMBER_SINT32,
+        &mut out as *mut i32 as *mut std::ffi::c_void,
+    );
+    (ok != 0).then_some(out)
+}
+
+/// Hit-tests the on-screen window list at `(x, y)` and activates the owning app
+/// so a synthetic click in the *middle* of another window transfers focus the
+/// way a native click does (#3).
+#[cfg(target_os = "macos")]
+fn macos_activate_app_at_point(x: i32, y: i32) {
+    const OPT_ON_SCREEN_ONLY: u32 = 1 << 0;
+    const OPT_EXCLUDE_DESKTOP: u32 = 1 << 4;
+
+    let self_pid = std::process::id() as i32;
+    let px = x as f64;
+    let py = y as f64;
+
+    unsafe {
+        let list = CGWindowListCopyWindowInfo(OPT_ON_SCREEN_ONLY | OPT_EXCLUDE_DESKTOP, 0);
+        if list.is_null() {
+            return;
+        }
+        // The list is ordered front-to-back, so the first hit is the window the
+        // click actually lands on.
+        let count = CFArrayGetCount(list);
+        let mut hit_pid: Option<i32> = None;
+        for index in 0..count {
+            let window = CFArrayGetValueAtIndex(list, index);
+            if window.is_null() {
+                continue;
+            }
+            // Layer 0 is the normal application layer. Anything above it is the
+            // Dock, the menu bar, notification banners or a screen-saver style
+            // overlay — activating those would be wrong.
+            if cf_dict_i32(window, b"kCGWindowLayer\0").unwrap_or(1) != 0 {
+                continue;
+            }
+            let Some(pid) = cf_dict_i32(window, b"kCGWindowOwnerPID\0") else {
+                continue;
+            };
+            if pid == self_pid {
+                continue;
+            }
+            let Some(bounds) = cf_dict_ref(window, b"kCGWindowBounds\0") else {
+                continue;
+            };
+            let bx = cf_dict_f64(bounds, b"X\0").unwrap_or(0.0);
+            let by = cf_dict_f64(bounds, b"Y\0").unwrap_or(0.0);
+            let bw = cf_dict_f64(bounds, b"Width\0").unwrap_or(0.0);
+            let bh = cf_dict_f64(bounds, b"Height\0").unwrap_or(0.0);
+            if bw <= 1.0 || bh <= 1.0 {
+                continue;
+            }
+            if px >= bx && px < bx + bw && py >= by && py < by + bh {
+                hit_pid = Some(pid);
+                break;
+            }
+        }
+        CFRelease(list);
+
+        if let Some(pid) = hit_pid {
+            // Already frontmost — re-activating would raise/flicker the window
+            // for no reason, and would fight a click that is just re-focusing a
+            // control inside the current app.
+            if macos_frontmost_pid() == Some(pid) {
+                return;
+            }
+            macos_activate_app_by_pid(pid);
+        }
+    }
+}
+
+/// Fetches a nested `CFDictionary` (e.g. `kCGWindowBounds`) without taking
+/// ownership — the value belongs to the enclosing dictionary.
+#[cfg(target_os = "macos")]
+unsafe fn cf_dict_ref(
+    dict: *const std::ffi::c_void,
+    key: &[u8],
+) -> Option<*const std::ffi::c_void> {
+    let cf_key = CFStringCreateWithCString(
+        std::ptr::null(),
+        key.as_ptr() as *const std::os::raw::c_char,
+        CF_STRING_ENCODING_UTF8,
+    );
+    if cf_key.is_null() {
+        return None;
+    }
+    let value = CFDictionaryGetValue(dict, cf_key);
+    CFRelease(cf_key);
+    (!value.is_null()).then_some(value)
+}
+
+/// pid of the app that currently owns the foreground, or `None` if AppKit will
+/// not tell us (e.g. during a Space transition).
+#[cfg(target_os = "macos")]
+fn macos_frontmost_pid() -> Option<i32> {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    unsafe {
+        let cls = objc_getClass(b"NSWorkspace\0".as_ptr() as *const c_char);
+        if cls.is_null() {
+            return None;
+        }
+        let msg: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let ws = msg(
+            cls,
+            sel_registerName(b"sharedWorkspace\0".as_ptr() as *const c_char),
+        );
+        if ws.is_null() {
+            return None;
+        }
+        let app = msg(
+            ws,
+            sel_registerName(b"frontmostApplication\0".as_ptr() as *const c_char),
+        );
+        if app.is_null() {
+            return None;
+        }
+        let pid_msg: extern "C" fn(*mut c_void, *mut c_void) -> i32 =
+            std::mem::transmute(objc_msgSend as *const ());
+        Some(pid_msg(
+            app,
+            sel_registerName(b"processIdentifier\0".as_ptr() as *const c_char),
+        ))
+    }
+}
+
+/// `[[NSRunningApplication runningApplicationWithProcessIdentifier: pid]
+///   activateWithOptions: NSApplicationActivateIgnoringOtherApps]`
+#[cfg(target_os = "macos")]
+fn macos_activate_app_by_pid(pid: i32) {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    unsafe {
+        let cls = objc_getClass(b"NSRunningApplication\0".as_ptr() as *const c_char);
+        if cls.is_null() {
+            return;
+        }
+        let sel =
+            sel_registerName(b"runningApplicationWithProcessIdentifier:\0".as_ptr() as *const c_char);
+        let msg: extern "C" fn(*mut c_void, *mut c_void, i32) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let app = msg(cls, sel, pid);
+        if app.is_null() {
+            return;
+        }
+        let act = sel_registerName(b"activateWithOptions:\0".as_ptr() as *const c_char);
+        // NSApplicationActivateIgnoringOtherApps = 1 << 1
+        let msg_opt: extern "C" fn(*mut c_void, *mut c_void, u64) =
+            std::mem::transmute(objc_msgSend as *const ());
+        msg_opt(app, act, 2);
     }
 }
 
@@ -6578,6 +7468,8 @@ mod tests {
             fullscreen_pause: true,
             mouse_smoothing: true,
             smooth_scroll: true,
+            reverse_scroll: false,
+            pause_app_whitelist: Vec::new(),
         }
     }
 
@@ -7549,7 +8441,6 @@ mod tests {
     #[test]
     fn fast_crossing_carries_entry_delta_into_remote() {
         let target = target_for_coordinate_tests();
-        let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
         let active = crossing_target(&[target], 1919.0, 500.0, 40.0, 0.0)
             .expect("fast edge movement should cross");
 

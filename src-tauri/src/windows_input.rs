@@ -311,7 +311,19 @@ pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     }
 }
 
+/// One notch of wheel travel in Win32 `mouseData` units.
+pub const WHEEL_DELTA: i32 = 120;
+
+/// Posts a whole-notch scroll. `delta_x` / `delta_y` are notch counts.
 pub fn inject_scroll(delta_x: i32, delta_y: i32) {
+    inject_scroll_units(delta_x * WHEEL_DELTA, delta_y * WHEEL_DELTA);
+}
+
+/// Posts a scroll in raw `WHEEL_DELTA` units, allowing sub-notch increments.
+/// Used by the smooth-scroll interpolator, which spreads one notch over many
+/// small frames; applications accumulate the partial deltas the same way they
+/// do for a precision touchpad.
+pub fn inject_scroll_units(delta_x: i32, delta_y: i32) {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, MOUSEINPUT,
     };
@@ -327,7 +339,7 @@ pub fn inject_scroll(delta_x: i32, delta_y: i32) {
                 mi: MOUSEINPUT {
                     dx: 0,
                     dy: 0,
-                    mouseData: (delta * 120) as u32,
+                    mouseData: delta as u32,
                     dwFlags: flag,
                     time: 0,
                     dwExtraInfo: 0,

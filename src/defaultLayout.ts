@@ -38,6 +38,8 @@ export const defaultLayout: LayoutState = {
   fullscreenPause: true,
   mouseSmoothing: true,
   smoothScroll: true,
+  reverseScroll: false,
+  pauseAppWhitelist: [],
   devices: [
     {
       id: 'local-device',

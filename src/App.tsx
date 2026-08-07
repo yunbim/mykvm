@@ -48,7 +48,7 @@ import {
 } from "./desktopApi";
 import type { AppUpdateInfo } from "./desktopApi";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
-import { TEXT } from "./i18n";
+import { TEXT, activeText, setActiveLanguage } from "./i18n";
 import type { AppText } from "./i18n";
 import {
   formatEdgeSwitchHotkeyForDisplay,
@@ -101,11 +101,17 @@ const DEVICE_COLORS = [
   "#be123c",
   "#0891b2",
 ];
-const PLATFORM_LABELS = {
-  windows: "Windows",
-  macos: "macOS",
-  unknown: "Unknown",
-} as const;
+/** "Windows" / "macOS" are proper nouns and stay as-is in both languages; only
+ *  the "unknown" fallback needs translating (#6). */
+function platformLabel(platform: Device["platform"], language: AppLanguage) {
+  if (platform === "windows") {
+    return "Windows";
+  }
+  if (platform === "macos") {
+    return "macOS";
+  }
+  return TEXT[language].devices.unknownPlatform;
+}
 const WORKSPACE_TABS = [
   { id: "layout" },
   { id: "devices" },
@@ -374,7 +380,7 @@ function App() {
                 setErrorMessage(
                   error instanceof Error
                     ? error.message
-                    : TEXT.cn.errors.updateRuntime,
+                    : activeText().errors.updateRuntime,
                 );
               }
             })
@@ -388,7 +394,7 @@ function App() {
       .catch((error: unknown) => {
         if (active) {
           setErrorMessage(
-            error instanceof Error ? error.message : TEXT.cn.errors.loadState,
+            error instanceof Error ? error.message : activeText().errors.loadState,
           );
         }
       });
@@ -586,12 +592,21 @@ function App() {
   }, [activeTab, snapshot?.layout.machineRole]);
 
   const layout = snapshot?.layout;
+  const dragCrossingHoldMs = layout?.dragCrossingHoldMs ?? 800;
   const [dragCrossingHoldText, setDragCrossingHoldText] = useState(() =>
-    String(layout?.dragCrossingHoldMs ?? 800),
+    String(dragCrossingHoldMs),
   );
-  useEffect(() => {
-    setDragCrossingHoldText(String(layout?.dragCrossingHoldMs ?? 800));
-  }, [layout?.dragCrossingHoldMs]);
+  // Re-sync the editable text whenever the stored value changes underneath us
+  // (another window, a config reload). React's documented "adjust state during
+  // render" pattern — doing this in an effect caused a cascading second render.
+  const [syncedHoldMs, setSyncedHoldMs] = useState(dragCrossingHoldMs);
+  if (syncedHoldMs !== dragCrossingHoldMs) {
+    setSyncedHoldMs(dragCrossingHoldMs);
+    setDragCrossingHoldText(String(dragCrossingHoldMs));
+  }
+  // Text being typed into the "pause for these apps" field, before it is
+  // committed to the layout as a list entry (#8).
+  const [pauseAppDraft, setPauseAppDraft] = useState("");
   const runtime = snapshot?.runtime;
   const discovery = runtime?.discovery;
   const displayLayout = useMemo(
@@ -619,6 +634,9 @@ function App() {
   const themeMode = layout?.themeMode ?? "system";
   const resolvedTheme = resolveTheme(themeMode, systemTheme);
   const ui = TEXT[language];
+  // Keep the out-of-render mirror in step so promise callbacks and toasts speak
+  // the same language as the rest of the UI (#6).
+  setActiveLanguage(language);
   const hasLoadedSnapshot = Boolean(snapshot);
   const isAvailableUpdateDismissed =
     Boolean(availableUpdate) &&
@@ -1431,6 +1449,40 @@ function App() {
     }));
   }
 
+  function setReverseScroll(reverseScroll: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      reverseScroll,
+    }));
+  }
+
+  /** Adds a bundle id / executable name to the "pause while this app is in
+   *  front" list. Entries are normalised the same way the backend does
+   *  (trimmed + lowercased) so the comparison there is a plain equality. */
+  function addPauseApp(rawValue: string) {
+    const value = rawValue.trim().toLowerCase();
+    if (!value) {
+      return;
+    }
+    setPauseAppDraft("");
+    updateLayout((layoutState) => {
+      const current = layoutState.pauseAppWhitelist ?? [];
+      if (current.includes(value)) {
+        return layoutState;
+      }
+      return { ...layoutState, pauseAppWhitelist: [...current, value] };
+    });
+  }
+
+  function removePauseApp(value: string) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      pauseAppWhitelist: (layoutState.pauseAppWhitelist ?? []).filter(
+        (entry) => entry !== value,
+      ),
+    }));
+  }
+
   function setEdgeSwitchHotkey(edgeSwitchHotkey: string) {
     updateLayout((layoutState) => ({
       ...layoutState,
@@ -2032,7 +2084,7 @@ function App() {
               className="role-choice-card"
               onClick={() => void setMachineRole("server")}
             >
-              <span>Server</span>
+              <span>{ui.onboarding.serverBadge}</span>
               <strong>{ui.onboarding.serverTitle}</strong>
               <p>{ui.onboarding.serverCopy}</p>
             </button>
@@ -2041,7 +2093,7 @@ function App() {
               className="role-choice-card"
               onClick={() => void setMachineRole("client")}
             >
-              <span>Client</span>
+              <span>{ui.onboarding.clientBadge}</span>
               <strong>{ui.onboarding.clientTitle}</strong>
               <p>{ui.onboarding.clientCopy}</p>
             </button>
@@ -2455,7 +2507,8 @@ function App() {
                           </div>
                         </div>
                         <p className="connection-meta">
-                          {PLATFORM_LABELS[device.platform]} · {device.host} ·{" "}
+                          {platformLabel(device.platform, language)} ·{" "}
+                          {device.host} ·{" "}
                           {formatScreenCount(device.screens.length, language)}
                         </p>
                       </div>
@@ -2826,6 +2879,92 @@ function App() {
                     >
                       {ui.common.disabled}
                     </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.reverseScroll}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.reverseScrollCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.reverseScroll ? "active" : ""}
+                      onClick={() => setReverseScroll(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.reverseScroll ? "active" : ""}
+                      onClick={() => setReverseScroll(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row settings-control-row-stacked">
+                  <span>
+                    {ui.settings.pauseWhitelist}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.pauseWhitelistCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="pause-whitelist">
+                    <div className="pause-whitelist-input">
+                      <input
+                        type="text"
+                        className="settings-number-input"
+                        value={pauseAppDraft}
+                        placeholder={ui.settings.pauseWhitelistPlaceholder}
+                        onChange={(event) =>
+                          setPauseAppDraft(event.target.value)
+                        }
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            addPauseApp(pauseAppDraft);
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        disabled={!pauseAppDraft.trim()}
+                        onClick={() => addPauseApp(pauseAppDraft)}
+                      >
+                        {ui.settings.pauseWhitelistAdd}
+                      </button>
+                    </div>
+                    {(layout.pauseAppWhitelist ?? []).length === 0 ? (
+                      <p className="settings-hint">
+                        {ui.settings.pauseWhitelistEmpty}
+                      </p>
+                    ) : (
+                      <ul className="pause-whitelist-items">
+                        {(layout.pauseAppWhitelist ?? []).map((entry) => (
+                          <li key={entry}>
+                            <span title={entry}>{entry}</span>
+                            <button
+                              type="button"
+                              className="secondary-button compact-button danger-button"
+                              aria-label={`${ui.settings.pauseWhitelistRemove} ${entry}`}
+                              onClick={() => removePauseApp(entry)}
+                            >
+                              ×
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
                 </div>
                 <div className="settings-control-row">
@@ -3923,6 +4062,7 @@ function formatFileTransferSummary(
     } to ${summary.targetName} · ${size}`;
   }
 
+  // Explicitly the Chinese branch — `language` is not "en" here.
   return `${summary.fileCount} 个文件${TEXT.cn.devices.fileTransferSent}到 ${summary.targetName} · ${size}`;
 }
 

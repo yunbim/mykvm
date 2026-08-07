@@ -268,6 +268,15 @@ struct LayoutState {
     /// events for "Mos"-style smooth scrolling on the receiving side.
     #[serde(default = "default_smooth_scroll")]
     smooth_scroll: bool,
+    /// Reverse the scroll direction (Mos-style natural scrolling): content
+    /// follows the finger like a touchscreen.
+    #[serde(default = "default_reverse_scroll")]
+    reverse_scroll: bool,
+    /// App identifiers (macOS bundle id / Windows exe name) that pause input
+    /// sharing while they own the foreground — e.g. a game you don't want
+    /// sharing to interrupt.
+    #[serde(default = "default_pause_whitelist")]
+    pause_app_whitelist: Vec<String>,
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -728,6 +737,7 @@ impl AppRuntime {
         let layout_for_clipboard = Arc::clone(&self.layout);
         let layout_for_pairing = Arc::clone(&self.layout);
         let native_layout_for_input = self.native_layout();
+        let native_layout_for_input_stream = native_layout_for_input.clone();
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
         let clipboard_receive_enabled = Arc::clone(&self.clipboard_receive_enabled);
         let clipboard_seen_text = Arc::clone(&self.clipboard_seen_text);
@@ -743,6 +753,9 @@ impl AppRuntime {
         let pairing_challenge_for_stream = Arc::clone(&self.pairing_challenge);
         let config_path_for_pairing = self.config_path.clone();
         let peers_for_pairing = Arc::clone(&self.peers);
+        let layout_for_input_stream = Arc::clone(&self.layout);
+        let input_events_stream = Arc::clone(&self.input_events);
+        let clipboard_target_stream = Arc::clone(&self.clipboard_target);
 
         let on_datagram = Arc::new(move |payload: Vec<u8>, source| {
             if !input_receive_enabled.load(Ordering::Relaxed) {
@@ -761,6 +774,19 @@ impl AppRuntime {
         });
 
         let on_stream = Arc::new(move |payload: Vec<u8>, source| {
+            // #9: keyboard events now arrive on reliable QUIC streams; dispatch
+            // them through the same input handler used for datagrams.
+            if input::handle_input_datagram(
+                &layout_for_input_stream,
+                &native_layout_for_input_stream,
+                &payload,
+                source,
+                &input_events_stream,
+                &clipboard_target_stream,
+            ) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
             if handle_pairing_stream_packet(
                 &payload,
                 source,
@@ -1391,7 +1417,15 @@ fn apply_scene_guard_settings(layout: &LayoutState) {
 }
 
 fn apply_input_smoothing_settings(layout: &LayoutState) {
-    input::set_input_smoothing(layout.mouse_smoothing, layout.smooth_scroll);
+    input::set_input_smoothing(
+        layout.mouse_smoothing,
+        layout.smooth_scroll,
+        layout.reverse_scroll,
+    );
+    input::set_pause_whitelist(layout.pause_app_whitelist.clone());
+    // Watcher threads raise native notifications off the UI thread, so they need
+    // their own copy of the language setting (#6).
+    input::set_notify_language(&layout.language);
 }
 
 fn runtime_relevant_layout_changed(previous: &LayoutState, next: &LayoutState) -> bool {
@@ -2695,21 +2729,53 @@ fn macos_instance_socket_path() -> std::path::PathBuf {
 
 #[cfg(target_os = "macos")]
 pub fn acquire_single_instance() -> bool {
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
+    use std::os::unix::net::UnixStream;
 
     let path = macos_instance_socket_path();
-    // A stale socket file left behind by a crashed instance would block
-    // bind(); the kernel only enforces the lock while a listener is actually
-    // bound, so removing an orphaned file is safe.
-    let _ = std::fs::remove_file(&path);
+    // Bind first, never `remove_file` up front. Two launch attempts fired at
+    // the same moment (e.g. a LaunchAgent + a system "Login Item" both starting
+    // the app) previously raced: each removed the socket and then bound a fresh
+    // one, so both believed they were the primary -> two menu-bar icons fighting.
+    // Now the first `bind` wins and starts listening; the loser gets AddrInUse,
+    // probes the socket, and — finding a live owner — activates it and exits.
     match UnixListener::bind(&path) {
         Ok(listener) => {
             let _ = MACOS_INSTANCE_LISTENER.get_or_init(|| listener);
             true
         }
-        Err(error) => {
-            log::info!("another MyKVM instance owns {:?} ({}); focusing it", path, error);
-            false
+        Err(_) => {
+            // A socket file exists. It may belong to a live instance (normal)
+            // or be an orphan left by a crash. Probe: if we can connect, a real
+            // instance owns it -> nudge it to the front and bow out. Only if the
+            // connect is refused do we treat the file as stale and rebind. Unix
+            // stream connections are reliable, so the ACTIVATE byte is not lost
+            // even if the owner's accept loop hasn't started reading yet.
+            if let Ok(mut stream) = UnixStream::connect(&path) {
+                let _ = stream.write_all(&[MACOS_INSTANCE_ACTIVATE]);
+                log::info!("another MyKVM instance owns {:?}; focusing it", path);
+                false
+            } else {
+                let _ = std::fs::remove_file(&path);
+                match UnixListener::bind(&path) {
+                    Ok(listener) => {
+                        let _ = MACOS_INSTANCE_LISTENER.get_or_init(|| listener);
+                        true
+                    }
+                    Err(error) => {
+                        log::info!(
+                            "another MyKVM instance owns {:?} ({}); focusing it",
+                            path,
+                            error
+                        );
+                        if let Ok(mut stream) = UnixStream::connect(&path) {
+                            let _ = stream.write_all(&[MACOS_INSTANCE_ACTIVATE]);
+                        }
+                        false
+                    }
+                }
+            }
         }
     }
 }
@@ -3015,6 +3081,43 @@ fn macos_order_front_window(window: &tauri::WebviewWindow) -> Result<(), String>
     Ok(())
 }
 
+/// Switches the app's Dock presence at runtime. `0` = Regular (appears in the
+/// Dock), `1` = Accessory (menu-bar only, no Dock), `2` = Prohibited.
+/// `LSUIElement=true` already declares us Accessory at launch, but that
+/// setting is unreliable on some macOS/Tauri builds (the Dock icon still
+/// shows), so we enforce it imperatively: no Dock until the window is shown,
+/// Dock appears while the window is open, Dock drops the moment it closes.
+#[cfg(target_os = "macos")]
+fn macos_set_activation_policy(policy: i64) {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    unsafe {
+        let app_class = objc_getClass(b"NSApplication\0".as_ptr() as *const c_char);
+        if app_class.is_null() {
+            return;
+        }
+        let shared_sel = sel_registerName(b"sharedApplication\0".as_ptr() as *const c_char);
+        let msg_id: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let ns_app = msg_id(app_class, shared_sel);
+        if ns_app.is_null() {
+            return;
+        }
+        let policy_sel = sel_registerName(b"setActivationPolicy:\0".as_ptr() as *const c_char);
+        let msg_policy: extern "C" fn(*mut c_void, *mut c_void, i64) =
+            std::mem::transmute(objc_msgSend as *const ());
+        msg_policy(ns_app, policy_sel, policy);
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn macos_set_main_webview_cursor_hidden(app: &AppHandle, hidden: bool) {
     let Some(window) = app.get_webview_window("main") else {
@@ -3208,11 +3311,15 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
             setup_single_instance_events(app.handle().clone());
-            if silent_launch {
-                hide_main_window_handle(app.handle())?;
-            } else {
-                show_main_window_handle(app.handle())?;
-            }
+            #[cfg(target_os = "macos")]
+            macos_set_activation_policy(1); // Accessory: no Dock until the window is shown
+            // Always launch hidden (agent-style, like Mos): no window pops at
+            // login, and the Dock icon only appears once the user opens the
+            // window from the menu bar or a Reopen event. This also fixes the
+            // case where the app was added to macOS "Login Items" (which
+            // launches without our autostart arg and used to show a window).
+            let _ = silent_launch;
+            hide_main_window_handle(app.handle())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3359,6 +3466,8 @@ fn show_main_window_handle(app: &AppHandle) -> Result<(), String> {
         .map_err(|error| format!("failed to restore main window: {error}"))?;
     #[cfg(target_os = "macos")]
     macos_order_front_window(&window)?;
+    #[cfg(target_os = "macos")]
+    macos_set_activation_policy(0); // Regular: show in the Dock while the window is open
     set_main_window_visible(app, true);
     window
         .set_focus()
@@ -3383,6 +3492,8 @@ fn destroy_main_window_handle(app: &AppHandle) -> Result<(), String> {
     if result.is_ok() {
         set_main_window_visible(app, false);
         set_main_window_focused(app, false);
+        #[cfg(target_os = "macos")]
+        macos_set_activation_policy(1); // Accessory: drop from the Dock now the window is gone
     }
 
     result
@@ -4128,6 +4239,8 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         fullscreen_pause: default_fullscreen_pause(),
         mouse_smoothing: default_mouse_smoothing(),
         smooth_scroll: default_smooth_scroll(),
+        reverse_scroll: default_reverse_scroll(),
+        pause_app_whitelist: default_pause_whitelist(),
         devices: vec![Device {
             id: device_id,
             name: local_device_name(),
@@ -4176,6 +4289,8 @@ fn detect_fallback_layout() -> LayoutState {
         fullscreen_pause: default_fullscreen_pause(),
         mouse_smoothing: default_mouse_smoothing(),
         smooth_scroll: default_smooth_scroll(),
+        reverse_scroll: default_reverse_scroll(),
+        pause_app_whitelist: default_pause_whitelist(),
     }
 }
 
@@ -4294,6 +4409,8 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         fullscreen_pause: saved_layout.fullscreen_pause,
         mouse_smoothing: saved_layout.mouse_smoothing,
         smooth_scroll: saved_layout.smooth_scroll,
+        reverse_scroll: saved_layout.reverse_scroll,
+        pause_app_whitelist: normalize_pause_whitelist(&saved_layout.pause_app_whitelist),
     }
 }
 
@@ -4545,6 +4662,14 @@ fn default_smooth_scroll() -> bool {
     true
 }
 
+fn default_reverse_scroll() -> bool {
+    false
+}
+
+fn default_pause_whitelist() -> Vec<String> {
+    Vec::new()
+}
+
 fn default_transport_port_mode() -> String {
     "auto".into()
 }
@@ -4657,6 +4782,25 @@ fn normalize_paired_controllers(controllers: Vec<PairedController>) -> Vec<Paire
                 && !controller.cluster_id.trim().is_empty()
         })
         .collect()
+}
+
+fn normalize_pause_whitelist(list: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in list {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() || trimmed.len() > 200 {
+            continue;
+        }
+        let lowered = trimmed.to_lowercase();
+        if out.iter().any(|existing| existing == &lowered) {
+            continue;
+        }
+        out.push(lowered);
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    out
 }
 
 fn normalize_language(language: &str) -> String {
@@ -7283,6 +7427,8 @@ mod tests {
             fullscreen_pause: true,
             mouse_smoothing: true,
             smooth_scroll: true,
+            reverse_scroll: false,
+            pause_app_whitelist: Vec::new(),
         }
     }
 

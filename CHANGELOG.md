@@ -8,8 +8,22 @@ release will reuse them).
 
 ## [Unreleased]
 
+### Added
+
+- **Pause for specific apps.** You can now list the apps that should pause input sharing (a bundle id on macOS, an executable name on Windows). Once the list has anything in it, it fully replaces the old "pause for any fullscreen app" rule, so watching a fullscreen video or using a fullscreen browser no longer steals the pointer back. Leave the list empty to keep the previous fullscreen behaviour.
+- **Reverse scroll direction.** A per-machine toggle that makes content follow your finger, the way macOS "natural scrolling" does — handy when the two machines disagree about scroll direction.
+
 ### Fixed
 
+- **Smooth scrolling no longer changes how far you scroll.** One wheel notch now travels the same distance whether smoothing is on or off. Previously the smoothed path lost distance to rounding on every frame, and on a Windows receiver it *multiplied* each notch by roughly 33× because the interpolator's pixel output was posted as whole wheel notches.
+- **Smooth scrolling actually eases now.** The curve filter was a no-op pass-through; it now matches Mos' behaviour, and the interpolator flushes what it still owes when a scroll settles instead of swallowing the last pixel.
+- Unsmoothed scrolling on macOS moved a single pixel per notch (it was posting a notch count as a pixel delta). It now posts a proper line scroll.
+- The smooth-scroll worker no longer wakes 125 times a second forever — it parks between scrolls and costs nothing while idle.
+- Keyboard input from Windows to macOS could drop characters under load. Key events now travel over an acknowledged reliable stream instead of unreliable datagrams, with datagrams kept only as a fallback.
+- macOS: clicking the *middle* of another window (not just its title bar) now transfers focus, matching native behaviour. Dock, menu bar, and notification-centre layers are correctly excluded from the hit test.
+- macOS: launching at login no longer pops the window open, and the Dock icon now appears only while the window is actually visible.
+- macOS: a reboot no longer starts two copies of the app.
+- Pause/resume notifications now follow the app language instead of always being Chinese, and several untranslated strings in the UI ("Server"/"Client" badges, unknown platform label, a `bate`/`beta` typo) were fixed.
 - Keyboard, mouse, and clipboard could fail to connect between machines — the QUIC handshake rejected the peer with `invalid peer certificate: BadSignature`. The transport now pins the device's advertised certificate directly instead of running brittle chain validation over a self-signed certificate, which fixes cross-platform (macOS ↔ Windows) handshakes.
 
 ## v0.4.0

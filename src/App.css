@@ -1507,6 +1507,91 @@
   margin-top: 10px;
 }
 
+/* The pause-whitelist editor needs the full row width, so it drops the
+   label/control two-column grid and stacks instead. */
+.settings-control-row-stacked {
+  display: block;
+}
+
+.settings-control-row-stacked > span {
+  display: inline-flex;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.pause-whitelist {
+  display: grid;
+  gap: 8px;
+}
+
+.pause-whitelist-input {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.pause-whitelist-input .settings-number-input {
+  flex: 1 1 auto;
+}
+
+.pause-whitelist-input .compact-button {
+  flex: 0 0 auto;
+}
+
+.pause-whitelist-items {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+
+.pause-whitelist-items li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 10px;
+  border: 1px solid rgba(63, 63, 70, 0.92);
+  border-radius: 8px;
+  background: #18181b;
+}
+
+.pause-whitelist-items li > span {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: #f4f4f5;
+}
+
+.pause-whitelist-items li > .compact-button {
+  flex: 0 0 auto;
+  min-width: 32px;
+  padding: 0 8px;
+}
+
+.settings-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #a1a1aa;
+}
+
+.theme-light .pause-whitelist-items li {
+  border-color: #c4ccda;
+  background: #f6f8fc;
+}
+
+.theme-light .pause-whitelist-items li > span {
+  color: #172033;
+}
+
+.theme-light .settings-hint {
+  color: #5b6577;
+}
+
 .settings-control-row > span {
   color: #a1a1aa;
   font-size: 13px;
