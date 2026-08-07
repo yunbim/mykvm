@@ -42,7 +42,7 @@ export const TEXT = {
       copy: "读取本机配置、显示器布局和桌面运行状态。",
     },
     onboarding: {
-      eyebrow: "MyKVM setup",
+      eyebrow: "MyKVM 设置",
       title: "选择这台设备的工作模式",
       copy: "服务端负责发现并添加其它设备；客户端保持轻量运行，只接收服务端共享过来的鼠标和键盘。",
       serverTitle: "服务端",
@@ -52,7 +52,7 @@ export const TEXT = {
         "进入精简状态页，默认仅接收远端键鼠输入，适合被控设备常驻后台。",
     },
     settings: {
-      eyebrow: "Settings",
+      eyebrow: "设置",
       title: "设置",
       subtitle: "工作模式、传输端口、语言主题、剪贴板同步和本机状态。",
       roleTitle: "工作模式",
@@ -70,6 +70,23 @@ export const TEXT = {
       screenSwitchRecording: "按下快捷键...",
       screenSwitchCopy:
         "仅服务端注册。按方向快捷键把控制权切到对应方向的相邻客户端；控制远端时再按任意切屏快捷键切回本机。",
+      sceneGuardTitle: "场景识别",
+      sceneGuardCopy:
+        "识别拖拽和全屏场景，避免协同在你正常操作时抢走光标。",
+      dragEdgeGuard: "拖拽时锁定边界",
+      dragEdgeGuardCopy:
+        "按住鼠标拖窗口撞边界时不跨屏，贴边分屏正常可用；顶住边界超过下面的时长仍会跨屏，用于把内容拖到另一台设备。",
+      dragCrossingHold: "拖拽跨屏延时",
+      dragCrossingHoldUnit: "毫秒",
+      fullscreenPause: "全屏应用自动暂停",
+      fullscreenPauseCopy:
+        "前台出现全屏应用（如 FPS 游戏）时自动暂停边界切换、切屏快捷键和剪贴板同步，退出全屏后立即恢复。仅 Windows 生效。",
+      mouseSmoothing: "鼠标平滑",
+      mouseSmoothingCopy:
+        "对每次移动的位移做低通滤波，过滤采集与网络的微小抖动，远程光标更顺滑。",
+      smoothScroll: "Mos 风格滚动",
+      smoothScrollCopy:
+        "把一次滚轮刻度拆成一小串带缓动、按时间铺开的滚动事件，接收端像 Mos 一样平滑滚动。",
       appearanceTitle: "配置",
       language: "语言",
       simplifiedChinese: "cn 中文简体",
@@ -165,7 +182,7 @@ export const TEXT = {
       noSamples: "开启后开始采样",
     },
     layout: {
-      eyebrow: "Device layout",
+      eyebrow: "显示器布局",
       title: "显示器布局",
       addDevice: "添加设备",
       zoomIn: "放大",
@@ -173,7 +190,7 @@ export const TEXT = {
       fitView: "适配画布",
     },
     devices: {
-      eyebrow: "Connections",
+      eyebrow: "连接",
       title: "连接设备",
       subtitle:
         "扫描局域网设备，或输入 IP 手动连接。只有识别到屏幕信息的设备才会加入布局。",
@@ -299,6 +316,23 @@ export const TEXT = {
       screenSwitchRecording: "Press shortcut...",
       screenSwitchCopy:
         "Registered only on the server. Press a direction shortcut to jump to an adjacent client; while controlling a peer, press any quick-switch shortcut again to return to this machine.",
+      sceneGuardTitle: "Scene awareness",
+      sceneGuardCopy:
+        "Detects drag and fullscreen scenes so sharing never steals the cursor mid-gesture.",
+      dragEdgeGuard: "Lock edges while dragging",
+      dragEdgeGuardCopy:
+        "Holding a mouse button and shoving a window into an edge no longer crosses screens, so snap and split view keep working. Keep pressing past the delay below and the cursor still crosses, which is how you drag content onto the other machine.",
+      dragCrossingHold: "Drag crossing delay",
+      dragCrossingHoldUnit: "ms",
+      fullscreenPause: "Pause for fullscreen apps",
+      fullscreenPauseCopy:
+        "While a fullscreen app (an FPS game, say) owns the foreground, edge crossings, switch hotkeys and clipboard sync are suspended, resuming the moment it leaves fullscreen. Windows only.",
+      mouseSmoothing: "Mouse smoothing",
+      mouseSmoothingCopy:
+        "Low-pass filters each movement delta so capture/network jitter never reaches the remote cursor.",
+      smoothScroll: "Mos-style scroll",
+      smoothScrollCopy:
+        "Spreads one wheel tick into a short burst of eased, time-spaced scroll events so the receiving side scrolls smoothly, Mos-style.",
       appearanceTitle: "Configuration",
       language: "Language",
       simplifiedChinese: "cn 中文简体",

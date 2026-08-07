@@ -586,6 +586,12 @@ function App() {
   }, [activeTab, snapshot?.layout.machineRole]);
 
   const layout = snapshot?.layout;
+  const [dragCrossingHoldText, setDragCrossingHoldText] = useState(() =>
+    String(layout?.dragCrossingHoldMs ?? 800),
+  );
+  useEffect(() => {
+    setDragCrossingHoldText(String(layout?.dragCrossingHoldMs ?? 800));
+  }, [layout?.dragCrossingHoldMs]);
   const runtime = snapshot?.runtime;
   const discovery = runtime?.discovery;
   const displayLayout = useMemo(
@@ -1384,6 +1390,45 @@ function App() {
     if (!performanceMonitor) {
       setPerformanceSamples([]);
     }
+  }
+
+  function setDragEdgeGuard(dragEdgeGuard: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      dragEdgeGuard,
+    }));
+  }
+
+  function setDragCrossingHoldMs(dragCrossingHoldMs: number) {
+    // Mirrors the backend clamp so the UI can never persist a value the
+    // capture layer would silently override.
+    const clamped = Math.min(5000, Math.max(100, Math.round(dragCrossingHoldMs)));
+    setDragCrossingHoldText(String(clamped));
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      dragCrossingHoldMs: clamped,
+    }));
+  }
+
+  function setFullscreenPause(fullscreenPause: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      fullscreenPause,
+    }));
+  }
+
+  function setMouseSmoothing(mouseSmoothing: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      mouseSmoothing,
+    }));
+  }
+
+  function setSmoothScroll(smoothScroll: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      smoothScroll,
+    }));
   }
 
   function setEdgeSwitchHotkey(edgeSwitchHotkey: string) {
@@ -2632,6 +2677,157 @@ function App() {
                     </div>
                   </>
                 ) : null}
+                <div className="settings-group-header">
+                  <span>
+                    {ui.settings.sceneGuardTitle}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.sceneGuardCopy}
+                      </span>
+                    </span>
+                  </span>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.dragEdgeGuard}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.dragEdgeGuardCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.dragEdgeGuard ? "active" : ""}
+                      onClick={() => setDragEdgeGuard(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.dragEdgeGuard ? "active" : ""}
+                      onClick={() => setDragEdgeGuard(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.dragCrossingHold}</span>
+                  <span className="settings-number-with-unit">
+                    <input
+                      className="settings-number-input"
+                      type="number"
+                      min="100"
+                      max="5000"
+                      step="100"
+                      value={dragCrossingHoldText}
+                      disabled={!layout?.dragEdgeGuard}
+                      onChange={(event) =>
+                        setDragCrossingHoldText(event.target.value)
+                      }
+                      onBlur={(event) => {
+                        const parsed = Number(event.target.value);
+                        const clamped = Number.isFinite(parsed)
+                          ? Math.min(5000, Math.max(100, Math.round(parsed)))
+                          : layout.dragCrossingHoldMs;
+                        setDragCrossingHoldMs(clamped);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          (event.target as HTMLInputElement).blur();
+                        }
+                      }}
+                    />
+                    <span className="settings-number-unit">
+                      {ui.settings.dragCrossingHoldUnit}
+                    </span>
+                  </span>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.fullscreenPause}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.fullscreenPauseCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.fullscreenPause ? "active" : ""}
+                      onClick={() => setFullscreenPause(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.fullscreenPause ? "active" : ""}
+                      onClick={() => setFullscreenPause(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.mouseSmoothing}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.mouseSmoothingCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.mouseSmoothing ? "active" : ""}
+                      onClick={() => setMouseSmoothing(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.mouseSmoothing ? "active" : ""}
+                      onClick={() => setMouseSmoothing(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.smoothScroll}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.smoothScrollCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.smoothScroll ? "active" : ""}
+                      onClick={() => setSmoothScroll(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.smoothScroll ? "active" : ""}
+                      onClick={() => setSmoothScroll(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
                 <div className="settings-control-row">
                   <span>{ui.settings.clipboard}</span>
                   <div className="segmented-control">

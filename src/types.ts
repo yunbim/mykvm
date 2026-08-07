@@ -85,4 +85,18 @@ export interface LayoutState {
   modifierMap: ModifierMap
   edgeSwitchHotkey: string
   screenSwitchHotkeys: ScreenSwitchHotkeys
+  /** Refuse edge crossings while a mouse button is held, so dragging a window
+   *  into a snap zone keeps the cursor on this machine. */
+  dragEdgeGuard: boolean
+  /** How long a held-button shove must press against the edge before it is
+   *  treated as a deliberate crossing. */
+  dragCrossingHoldMs: number
+  /** Suspend sharing while a fullscreen app owns the foreground. */
+  fullscreenPause: boolean
+  /** Low-pass filter the per-event movement delta so jitter doesn't reach the
+   *  remote cursor. */
+  mouseSmoothing: boolean
+  /** Spread a wheel tick into a short burst of eased scroll events for
+   *  "Mos"-style smooth scrolling on the receiving side. */
+  smoothScroll: boolean
 }

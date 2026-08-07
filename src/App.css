@@ -175,6 +175,15 @@
   color: #657186;
 }
 
+.theme-light .settings-group-header {
+  border-top-color: #d7deea;
+  color: #172033;
+}
+
+.theme-light .settings-number-unit {
+  color: #657186;
+}
+
 .theme-light .hotkey-recorder-button {
   border-color: #c4ccda;
   background: #f6f8fc;
@@ -1239,6 +1248,39 @@
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   width: 100%;
+}
+
+.settings-group-header {
+  display: flex;
+  align-items: center;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(63, 63, 70, 0.45);
+  color: #f4f4f5;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.settings-number-with-unit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-number-with-unit .settings-number-input {
+  width: 96px;
+  flex: 0 0 auto;
+}
+
+.settings-number-unit {
+  color: #a1a1aa;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.settings-number-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .info-tooltip-host {

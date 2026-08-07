@@ -21,6 +21,7 @@ use tauri::{
     AppHandle, Emitter, Manager, Monitor, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_notification::NotificationExt;
 
 mod clipboard;
 mod input;
@@ -79,6 +80,16 @@ const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\MyKVM_SingleInstance";
 const ACTIVATE_INSTANCE_EVENT_NAME: &str = "Local\\MyKVM_ActivateWindow";
 #[cfg(target_os = "windows")]
 const QUIT_INSTANCE_EVENT_NAME: &str = "Local\\MyKVM_QuitExisting";
+
+// macOS single-instance lock via a Unix Domain Socket. Binding the socket
+// succeeds only when no other instance holds it; a second launch connects to
+// the socket and asks the existing instance to focus its window.
+#[cfg(target_os = "macos")]
+const MACOS_INSTANCE_ACTIVATE: u8 = 1;
+#[cfg(target_os = "macos")]
+const MACOS_INSTANCE_QUIT: u8 = 2;
+#[cfg(target_os = "macos")]
+static MACOS_INSTANCE_LISTENER: OnceLock<std::os::unix::net::UnixListener> = OnceLock::new();
 
 static HOSTNAME_CACHE: OnceLock<Option<String>> = OnceLock::new();
 
@@ -237,6 +248,26 @@ struct LayoutState {
     edge_switch_hotkey: String,
     #[serde(default)]
     screen_switch_hotkeys: ScreenSwitchHotkeys,
+    /// Refuse edge crossings while a mouse button is held, so dragging a window
+    /// into a snap / split-view zone does not throw the cursor to the other
+    /// machine. A sustained shove past `drag_crossing_hold_ms` still crosses,
+    /// which keeps drag-to-other-machine working.
+    #[serde(default = "default_drag_edge_guard")]
+    drag_edge_guard: bool,
+    #[serde(default = "default_drag_crossing_hold_ms")]
+    drag_crossing_hold_ms: u64,
+    /// Suspend edge crossings, switch hotkeys and clipboard sync while a
+    /// fullscreen app (typically a game) owns the foreground.
+    #[serde(default = "default_fullscreen_pause")]
+    fullscreen_pause: bool,
+    /// Low-pass filter the per-event movement delta so capture/network jitter
+    /// doesn't reach the remote cursor. On by default; toggleable.
+    #[serde(default = "default_mouse_smoothing")]
+    mouse_smoothing: bool,
+    /// Spread a wheel tick into a short burst of eased, time-spaced scroll
+    /// events for "Mos"-style smooth scrolling on the receiving side.
+    #[serde(default = "default_smooth_scroll")]
+    smooth_scroll: bool,
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -512,6 +543,7 @@ struct AppRuntime {
     clipboard_packets: Arc<AtomicU64>,
     runtime_toggle_shortcut: Mutex<Option<String>>,
     runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
+    tray_error_state: Arc<AtomicBool>,
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
     config_path: PathBuf,
@@ -550,6 +582,7 @@ impl AppRuntime {
             clipboard_packets: Arc::new(AtomicU64::new(0)),
             runtime_toggle_shortcut: Mutex::new(None),
             runtime_toggle_menu_item: Mutex::new(None),
+            tray_error_state: Arc::new(AtomicBool::new(false)),
             screen_switch_request: Arc::new(Mutex::new(None)),
             screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
             config_path,
@@ -1243,6 +1276,11 @@ fn save_layout(
         (previous_layout, saved_layout)
     };
 
+    // Scene guards are read from atomics on the capture hot path, so they apply
+    // live — no runtime restart needed.
+    apply_scene_guard_settings(&saved_layout);
+    apply_input_smoothing_settings(&saved_layout);
+
     if runtime_relevant_layout_changed(&previous_layout, &saved_layout) {
         if previous_layout.transport_port_mode != saved_layout.transport_port_mode
             || previous_layout.transport_port != saved_layout.transport_port
@@ -1343,6 +1381,19 @@ fn merge_local_runtime_device_fields(incoming: &mut LayoutState, current: &Layou
     }
 }
 
+/// Mirrors the drag/fullscreen guard settings into the input layer's atomics.
+fn apply_scene_guard_settings(layout: &LayoutState) {
+    input::set_scene_guard_settings(
+        layout.drag_edge_guard,
+        layout.drag_crossing_hold_ms,
+        layout.fullscreen_pause,
+    );
+}
+
+fn apply_input_smoothing_settings(layout: &LayoutState) {
+    input::set_input_smoothing(layout.mouse_smoothing, layout.smooth_scroll);
+}
+
 fn runtime_relevant_layout_changed(previous: &LayoutState, next: &LayoutState) -> bool {
     // Device list/position changes are intentionally NOT here: discovery and the
     // input-capture loop both read the shared layout live, so adding, removing,
@@ -1429,9 +1480,16 @@ fn start_runtime(
     app: AppHandle,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<RuntimeStatus, String> {
-    let runtime = start_runtime_inner(state.inner())?;
-    notify_runtime_state_changed(&app, &runtime);
-    Ok(runtime)
+    match start_runtime_inner(state.inner()) {
+        Ok(runtime) => {
+            notify_runtime_state_changed(&app, &runtime);
+            Ok(runtime)
+        }
+        Err(error) => {
+            set_tray_error(&app, true);
+            Err(error)
+        }
+    }
 }
 
 fn ready_transport_status(discovery: &DiscoveryStatus) -> NativeStageStatus {
@@ -1617,9 +1675,16 @@ fn stop_runtime(
     app: AppHandle,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<RuntimeStatus, String> {
-    let runtime = stop_runtime_inner(state.inner())?;
-    notify_runtime_state_changed(&app, &runtime);
-    Ok(runtime)
+    match stop_runtime_inner(state.inner()) {
+        Ok(runtime) => {
+            notify_runtime_state_changed(&app, &runtime);
+            Ok(runtime)
+        }
+        Err(error) => {
+            set_tray_error(&app, true);
+            Err(error)
+        }
+    }
 }
 
 fn toggle_runtime_from_app(app: &AppHandle) -> Result<RuntimeStatus, String> {
@@ -1629,31 +1694,80 @@ fn toggle_runtime_from_app(app: &AppHandle) -> Result<RuntimeStatus, String> {
         .lock()
         .map_err(|_| "runtime state lock poisoned".to_string())?
         .started;
-    let runtime = if started {
-        stop_runtime_inner(state.inner())?
+    let result = if started {
+        stop_runtime_inner(state.inner())
     } else {
-        start_runtime_inner(state.inner())?
+        start_runtime_inner(state.inner())
     };
-    notify_runtime_state_changed(app, &runtime);
-    Ok(runtime)
+    match result {
+        Ok(runtime) => {
+            notify_runtime_state_changed(app, &runtime);
+            Ok(runtime)
+        }
+        Err(error) => {
+            set_tray_error(app, true);
+            Err(error)
+        }
+    }
 }
 
 fn notify_runtime_state_changed(app: &AppHandle, runtime: &RuntimeStatus) {
+    // Successful runtime state changes clear any transient tray error indicator.
+    if let Some(state) = app.try_state::<AppRuntime>() {
+        state.tray_error_state.store(false, Ordering::Relaxed);
+    }
     update_runtime_tray_state(app, runtime.started);
     let _ = app.emit(RUNTIME_STATE_EVENT, runtime);
+    notify_user(
+        app,
+        "mykvm",
+        localized(
+            app,
+            (
+                if runtime.started { "协同已启动" } else { "协同已停止" },
+                if runtime.started {
+                    "mykvm 开始在各设备间共享键鼠。"
+                } else {
+                    "mykvm 已停止共享键鼠。"
+                },
+            ),
+            (
+                if runtime.started { "Sharing started" } else { "Sharing stopped" },
+                if runtime.started {
+                    "mykvm is now sharing keyboard and mouse across your devices."
+                } else {
+                    "mykvm has stopped sharing keyboard and mouse."
+                },
+            ),
+        ),
+    );
 }
 
 fn update_runtime_tray_state(app: &AppHandle, started: bool) {
     if let Some(state) = app.try_state::<AppRuntime>() {
+        #[cfg(target_os = "macos")]
+        let error = state.tray_error_state.load(Ordering::Relaxed);
         if let Ok(item) = state.runtime_toggle_menu_item.lock() {
             if let Some(item) = item.as_ref() {
                 let _ = item.set_text(runtime_toggle_menu_label(started));
             }
         }
-    }
 
-    if let Some(tray) = app.tray_by_id("main") {
-        let _ = tray.set_tooltip(Some(runtime_tray_tooltip(started)));
+        if let Some(tray) = app.tray_by_id("main") {
+            #[cfg(target_os = "macos")]
+            {
+                let variant = if error {
+                    "error"
+                } else if started {
+                    "active"
+                } else {
+                    "idle"
+                };
+                let _ = tray.set_icon(Some(macos_tray_icon(variant)));
+                let _ = tray.set_icon_as_template(variant != "error");
+            }
+            let _ = tray.set_tooltip(Some(runtime_tray_tooltip(started)));
+        }
     }
 }
 
@@ -1670,6 +1784,99 @@ fn runtime_tray_tooltip(started: bool) -> &'static str {
         "mykvm · 已启动"
     } else {
         "mykvm · 已停止"
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_tray_icon(variant: &str) -> tauri::image::Image<'static> {
+    let rgba: &[u8] = match variant {
+        "active" => include_bytes!("../icons/tray/macos-active.rgba"),
+        "idle" => include_bytes!("../icons/tray/macos-idle.rgba"),
+        "error" => include_bytes!("../icons/tray/macos-error.rgba"),
+        _ => unreachable!(),
+    };
+    tauri::image::Image::new_owned(rgba.to_vec(), 36, 36)
+}
+
+fn set_tray_error(app: &AppHandle, error: bool) {
+    if let Some(state) = app.try_state::<AppRuntime>() {
+        state.tray_error_state.store(error, Ordering::Relaxed);
+        let started = state
+            .runtime
+            .lock()
+            .map(|r| r.started)
+            .unwrap_or(false);
+        update_runtime_tray_state(app, started);
+    }
+    if error {
+        notify_user(
+            app,
+            "mykvm",
+            localized(
+                app,
+                ("运行出错", "Runtime error"),
+                (
+                    "协同运行时遇到问题，请查看托盘图标状态与日志。",
+                    "The sharing runtime hit a problem — check the tray icon and logs.",
+                ),
+            ),
+        );
+    }
+}
+
+/// Send a native OS notification. Cross-platform (Windows/Linux show a
+/// notification only for installed apps; in dev they fall back to the system
+/// notification path). Failures are logged, never surfaced to the caller —
+/// notifications are best-effort and must never break the runtime flow.
+fn notify_user(app: &AppHandle, app_name: &str, message: impl Into<NotificationMessage>) {
+    let message: NotificationMessage = message.into();
+    if let Err(error) = app
+        .notification()
+        .builder()
+        .title(message.title)
+        .body(message.body)
+        .show()
+    {
+        log::warn!("failed to send notification '{app_name}': {error}");
+    }
+}
+
+struct NotificationMessage {
+    title: String,
+    body: String,
+}
+
+impl NotificationMessage {
+    fn new(title: &str, body: &str) -> Self {
+        NotificationMessage {
+            title: title.to_string(),
+            body: body.to_string(),
+        }
+    }
+}
+
+impl From<(String, String)> for NotificationMessage {
+    fn from((title, body): (String, String)) -> Self {
+        NotificationMessage::new(&title, &body)
+    }
+}
+
+/// Pick cn/en strings based on the saved layout language.
+fn localized(
+    app: &AppHandle,
+    cn: (&str, &str),
+    en: (&str, &str),
+) -> NotificationMessage {
+    let lang = app
+        .state::<AppRuntime>()
+        .layout_snapshot()
+        .language
+        .as_str()
+        .to_lowercase();
+    if lang.starts_with("en") {
+        NotificationMessage::new(en.0, en.1)
+    } else {
+        NotificationMessage::new(cn.0, cn.1)
     }
 }
 
@@ -2481,7 +2688,33 @@ pub fn acquire_single_instance() -> bool {
     true
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn macos_instance_socket_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("mykvm.sock")
+}
+
+#[cfg(target_os = "macos")]
+pub fn acquire_single_instance() -> bool {
+    use std::os::unix::net::UnixListener;
+
+    let path = macos_instance_socket_path();
+    // A stale socket file left behind by a crashed instance would block
+    // bind(); the kernel only enforces the lock while a listener is actually
+    // bound, so removing an orphaned file is safe.
+    let _ = std::fs::remove_file(&path);
+    match UnixListener::bind(&path) {
+        Ok(listener) => {
+            let _ = MACOS_INSTANCE_LISTENER.get_or_init(|| listener);
+            true
+        }
+        Err(error) => {
+            log::info!("another MyKVM instance owns {:?} ({}); focusing it", path, error);
+            false
+        }
+    }
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn acquire_single_instance() -> bool {
     true
 }
@@ -2503,8 +2736,12 @@ fn release_single_instance() {
     }
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn release_single_instance() {
+    let _ = std::fs::remove_file(macos_instance_socket_path());
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn release_single_instance() {}
 
 pub fn activate_existing_instance() -> bool {
@@ -2513,7 +2750,20 @@ pub fn activate_existing_instance() -> bool {
         return signal_named_instance_event(ACTIVATE_INSTANCE_EVENT_NAME);
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        match UnixStream::connect(macos_instance_socket_path()) {
+            Ok(mut stream) => {
+                let _ = stream.write_all(&[MACOS_INSTANCE_ACTIVATE]);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         false
     }
@@ -2525,7 +2775,20 @@ pub fn request_existing_instance_quit() -> bool {
         return signal_named_instance_event(QUIT_INSTANCE_EVENT_NAME);
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        match UnixStream::connect(macos_instance_socket_path()) {
+            Ok(mut stream) => {
+                let _ = stream.write_all(&[MACOS_INSTANCE_QUIT]);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         false
     }
@@ -2561,7 +2824,43 @@ fn setup_single_instance_events(app: AppHandle) {
     spawn_instance_event_listener(QUIT_INSTANCE_EVENT_NAME, app, InstanceEvent::Quit);
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn setup_single_instance_events(app: AppHandle) {
+    use std::io::Read;
+
+    let Some(listener) = MACOS_INSTANCE_LISTENER.get() else {
+        return;
+    };
+    let Ok(owned) = listener.try_clone() else {
+        return;
+    };
+    thread::spawn(move || {
+        for connection in owned.incoming() {
+            let Ok(mut stream) = connection else {
+                continue;
+            };
+            let mut command = [0u8; 1];
+            if stream.read_exact(&mut command).is_err() {
+                continue;
+            }
+            match command[0] {
+                MACOS_INSTANCE_ACTIVATE => {
+                    let handle = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        let _ = show_main_window_handle(&handle);
+                    });
+                }
+                MACOS_INSTANCE_QUIT => {
+                    request_app_quit(&app);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn setup_single_instance_events(app: AppHandle) {
     let _ = app;
 }
@@ -2699,7 +2998,11 @@ fn macos_order_front_window(window: &tauri::WebviewWindow) -> Result<(), String>
             if !ns_app.is_null() {
                 let msg_bool: extern "C" fn(*mut c_void, *mut c_void, i8) =
                     std::mem::transmute(objc_msgSend as *const ());
-                msg_bool(ns_app, activate_sel, 1);
+                // `ignoringOtherApps: false` — activate MyKVM without yanking
+                // focus from whatever the user is doing (e.g. the remote machine
+                // they are currently controlling). This is the core of the
+                // "click focus must not transfer" fix for an Agent app.
+                msg_bool(ns_app, activate_sel, 0);
             }
         }
 
@@ -2707,11 +3010,6 @@ fn macos_order_front_window(window: &tauri::WebviewWindow) -> Result<(), String>
         let msg_id_arg: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
             std::mem::transmute(objc_msgSend as *const ());
         msg_id_arg(ns_window, make_key_sel, std::ptr::null_mut());
-
-        let order_front_sel = sel_registerName(b"orderFrontRegardless\0".as_ptr() as *const c_char);
-        let msg_void: extern "C" fn(*mut c_void, *mut c_void) =
-            std::mem::transmute(objc_msgSend as *const ());
-        msg_void(ns_window, order_front_sel);
     }
 
     Ok(())
@@ -2789,6 +3087,7 @@ fn setup_macos_window_visibility_watcher(app: &tauri::App) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_ARG]),
@@ -2864,6 +3163,14 @@ pub fn run() {
                 let state = app.state::<AppRuntime>();
                 let runtime_ref = state.inner();
                 let layout = runtime_ref.layout_snapshot();
+                // Publish the drag/fullscreen guards before capture starts, so
+                // the very first events already honour the saved settings.
+                apply_scene_guard_settings(&layout);
+                apply_input_smoothing_settings(&layout);
+                // Hand the app handle to the input layer so platform-specific
+                // watchers (e.g. the Windows fullscreen pause detector) can
+                // raise native notifications without plumbing it through capture.
+                input::set_app_handle_for_notify(app.handle().clone());
                 let _ = runtime_ref.start_discovery();
                 let (capture, inject) = runtime_ref.start_input(layout.clone());
                 let clipboard = runtime_ref.start_clipboard(layout.clone());
@@ -3026,6 +3333,14 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             }
         });
 
+    #[cfg(target_os = "macos")]
+    {
+        let initial_variant = if runtime_started { "active" } else { "idle" };
+        tray = tray
+            .icon(macos_tray_icon(initial_variant))
+            .icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon().cloned() {
         tray = tray.icon(icon);
     }
@@ -3808,6 +4123,11 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+        drag_edge_guard: default_drag_edge_guard(),
+        drag_crossing_hold_ms: default_drag_crossing_hold_ms(),
+        fullscreen_pause: default_fullscreen_pause(),
+        mouse_smoothing: default_mouse_smoothing(),
+        smooth_scroll: default_smooth_scroll(),
         devices: vec![Device {
             id: device_id,
             name: local_device_name(),
@@ -3851,6 +4171,11 @@ fn detect_fallback_layout() -> LayoutState {
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+        drag_edge_guard: default_drag_edge_guard(),
+        drag_crossing_hold_ms: default_drag_crossing_hold_ms(),
+        fullscreen_pause: default_fullscreen_pause(),
+        mouse_smoothing: default_mouse_smoothing(),
+        smooth_scroll: default_smooth_scroll(),
     }
 }
 
@@ -3964,6 +4289,11 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         modifier_map: normalize_modifier_map(&saved_layout.modifier_map),
         edge_switch_hotkey: normalize_edge_switch_hotkey(&saved_layout.edge_switch_hotkey),
         screen_switch_hotkeys: saved_layout.screen_switch_hotkeys.clone(),
+        drag_edge_guard: saved_layout.drag_edge_guard,
+        drag_crossing_hold_ms: saved_layout.drag_crossing_hold_ms.clamp(100, 5_000),
+        fullscreen_pause: saved_layout.fullscreen_pause,
+        mouse_smoothing: saved_layout.mouse_smoothing,
+        smooth_scroll: saved_layout.smooth_scroll,
     }
 }
 
@@ -4193,6 +4523,26 @@ fn default_theme_mode() -> String {
 
 fn default_performance_monitor() -> bool {
     false
+}
+
+fn default_drag_edge_guard() -> bool {
+    true
+}
+
+fn default_drag_crossing_hold_ms() -> u64 {
+    800
+}
+
+fn default_fullscreen_pause() -> bool {
+    true
+}
+
+fn default_mouse_smoothing() -> bool {
+    true
+}
+
+fn default_smooth_scroll() -> bool {
+    true
 }
 
 fn default_transport_port_mode() -> String {
@@ -4515,6 +4865,14 @@ fn run_clipboard_sync(
     let mut sequence = now_ms();
 
     while !stop.load(Ordering::Relaxed) {
+        // A fullscreen app (game) is frontmost: stop polling the clipboard so
+        // nothing competes for CPU or touches the pasteboard mid-frame.
+        if input::fullscreen_app_active() {
+            thread::sleep(Duration::from_millis(250));
+            last_poll = Instant::now() - Duration::from_secs(1);
+            continue;
+        }
+
         let Some(target) = input::current_clipboard_target(&clipboard_target) else {
             thread::sleep(Duration::from_millis(120));
             last_poll = Instant::now() - Duration::from_secs(1);
@@ -6920,6 +7278,11 @@ mod tests {
             modifier_map: default_modifier_map(),
             edge_switch_hotkey: default_edge_switch_hotkey(),
             screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+            drag_edge_guard: true,
+            drag_crossing_hold_ms: 800,
+            fullscreen_pause: true,
+            mouse_smoothing: true,
+            smooth_scroll: true,
         }
     }
 

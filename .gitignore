@@ -32,3 +32,6 @@ tmp/
 *.njsproj
 *.sln
 *.sw?
+
+# WorkBuddy internal memory / runtime data (not for version control)
+.workbuddy/

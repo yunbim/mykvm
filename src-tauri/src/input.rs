@@ -10,6 +10,8 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+use tauri_plugin_notification::NotificationExt;
 
 use crate::{
     quic_transport,
@@ -45,6 +47,15 @@ const RETURN_EDGE_INSET: f64 = 0.0;
 const RETURN_COOLDOWN_MS: u64 = 150;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
+// While a physical mouse button is held on this machine the user is almost
+// always dragging something — a window into an Aero Snap / split-view hot zone,
+// a selection rectangle, a scrollbar. Handing the cursor to the remote mid-drag
+// destroys those gestures, so a crossing is refused for the first
+// DRAG_CROSSING_HOLD_MS the pointer spends pressed against the shared edge.
+// Keep pushing past that and the crossing is allowed, which is what makes
+// dragging a file across to the other machine still work: the deliberate
+// "shove and hold" reads as intent, a snap-to-edge flick does not.
+const DRAG_CROSSING_HOLD_MS: u64 = 800;
 #[cfg(target_os = "macos")]
 const MACOS_IDLE_CAPTURE_LOOP_MS: u64 = 100;
 #[cfg(target_os = "macos")]
@@ -1012,6 +1023,9 @@ fn start_platform_capture(
         }
         context.remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&context.clipboard_target);
+        // The tap is gone, so button-up will never arrive; drop the drag gate
+        // rather than leaving it latched across a restart.
+        reset_local_button_mask();
     });
 
     match ready_rx.recv_timeout(Duration::from_secs(1)) {
@@ -1115,6 +1129,9 @@ fn start_platform_capture(
         }
 
         let _ = ready_tx.send(Ok(()));
+        // Watch for fullscreen apps taking over the foreground so sharing can
+        // step aside for the duration.
+        spawn_fullscreen_watcher(Arc::clone(&stop));
         let mut message = MSG::default();
         let mut last_desktop_check = Instant::now() - Duration::from_millis(200);
         while !stop.load(Ordering::Relaxed) {
@@ -1147,6 +1164,9 @@ fn start_platform_capture(
         context.remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&context.clipboard_target);
         clear_windows_capture_context();
+        // The hooks are gone, so button-up will never arrive; drop the drag
+        // gate rather than leaving it latched across a restart.
+        reset_local_button_mask();
     });
 
     match ready_rx.recv_timeout(Duration::from_secs(1)) {
@@ -2583,6 +2603,175 @@ struct WindowsCaptureContext {
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
 }
 
+// ---------------------------------------------------------------------------
+// Fullscreen scene detection (Windows)
+//
+// Exclusive / borderless-fullscreen apps — FPS games above all — must not have
+// the pointer yanked out from under them. While one is frontmost we suspend
+// edge crossings, the switch hotkeys and clipboard sync, then resume the
+// instant the app drops out of fullscreen, minimises or loses focus.
+//
+// Two signals, either is sufficient:
+//   1. SHQueryUserNotificationState() reporting D3D fullscreen or presentation
+//      mode. Catches true exclusive fullscreen cheaply.
+//   2. The foreground window's rect covering its monitor's full (not work-area)
+//      bounds, while not being the desktop or shell. Catches the borderless
+//      windowed-fullscreen mode most modern games actually ship with.
+// ---------------------------------------------------------------------------
+
+/// Set while a fullscreen app owns the foreground. Read on the hook hot path,
+/// written by the polling thread.
+static FULLSCREEN_APP_ACTIVE: AtomicBool = AtomicBool::new(false);
+// Held once at startup so the (platform-specific) fullscreen watcher thread can
+// raise a native notification on pause/resume without threading an AppHandle
+// through the capture plumbing.
+static NOTIFY_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+
+/// Store the app handle used to surface fullscreen pause/resume notifications.
+/// Called a single time during setup, before capture starts.
+pub fn set_app_handle_for_notify(handle: AppHandle) {
+    let _ = NOTIFY_APP_HANDLE.set(handle);
+}
+/// How often the watcher samples the foreground window.
+#[cfg(target_os = "windows")]
+const FULLSCREEN_POLL_INTERVAL_MS: u64 = 600;
+
+pub fn fullscreen_app_active() -> bool {
+    FULLSCREEN_APP_ACTIVE.load(Ordering::Relaxed)
+}
+
+#[cfg(target_os = "windows")]
+fn detect_windows_fullscreen_app() -> bool {
+    use windows_sys::Win32::Foundation::{HWND, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE,
+        QUNS_RUNNING_D3D_FULL_SCREEN,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindowRect, IsWindowVisible,
+    };
+
+    // Signal 1: the shell's own notion of "user is busy in fullscreen".
+    // QUNS_BUSY is deliberately excluded from the positive set — plenty of
+    // ordinary apps trip it — but D3D fullscreen and presentation mode are
+    // unambiguous.
+    let mut state = 0i32;
+    if unsafe { SHQueryUserNotificationState(&mut state) } == 0 {
+        if state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE {
+            return true;
+        }
+        let _ = QUNS_BUSY;
+    }
+
+    // Signal 2: borderless windowed fullscreen — foreground window rect equals
+    // the monitor's full bounds.
+    let hwnd: HWND = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return false;
+    }
+    // The desktop and the shell (Progman/WorkerW) always "cover" the monitor;
+    // treating them as fullscreen would pause the app on a bare desktop.
+    if hwnd == unsafe { GetDesktopWindow() } || hwnd == unsafe { GetShellWindow() } {
+        return false;
+    }
+    if unsafe { IsWindowVisible(hwnd) } == 0 {
+        return false;
+    }
+
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return false;
+    }
+
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_null() {
+        return false;
+    }
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        return false;
+    }
+
+    // Compare against rcMonitor (full bounds), not rcWork: a maximised ordinary
+    // window matches rcWork but leaves the taskbar visible, and the user still
+    // wants MyKVM live in that case. Only a window swallowing the taskbar too
+    // counts as fullscreen. A 1px tolerance absorbs games that size themselves
+    // slightly off.
+    let m = info.rcMonitor;
+    (rect.left - m.left).abs() <= 1
+        && (rect.top - m.top).abs() <= 1
+        && (rect.right - m.right).abs() <= 1
+        && (rect.bottom - m.bottom).abs() <= 1
+}
+
+/// Samples the foreground window on a background thread and publishes the
+/// result to `FULLSCREEN_APP_ACTIVE`. Only transitions are logged, so an idle
+/// game session stays quiet in the log.
+#[cfg(target_os = "windows")]
+fn spawn_fullscreen_watcher(stop: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            if !FULLSCREEN_PAUSE_ENABLED.load(Ordering::Relaxed) {
+                if FULLSCREEN_APP_ACTIVE.swap(false, Ordering::Relaxed) {
+                    log::info!("fullscreen pause disabled — input sharing resumed");
+                }
+                std::thread::sleep(Duration::from_millis(FULLSCREEN_POLL_INTERVAL_MS));
+                continue;
+            }
+            let active = detect_windows_fullscreen_app();
+            let previous = FULLSCREEN_APP_ACTIVE.swap(active, Ordering::Relaxed);
+            if previous != active {
+                log::info!(
+                    "fullscreen app {} — input sharing {}",
+                    if active { "detected" } else { "dismissed" },
+                    if active { "paused" } else { "resumed" }
+                );
+                // Never strand the pointer on the remote when a game takes over.
+                if active {
+                    if let Some(context) = windows_capture_context() {
+                        release_windows_remote_control(&context, false);
+                    }
+                }
+                // Surface the pause/resume as a native notification so the user
+                // knows sharing stepped aside for their game and came back.
+                if let Some(app) = NOTIFY_APP_HANDLE.get() {
+                    let (title, body) = if active {
+                        (
+                            "mykvm · 已暂停",
+                            "检测到全屏应用，已暂停键鼠共享，不影响你操作。",
+                        )
+                    } else {
+                        (
+                            "mykvm · 已恢复",
+                            "全屏应用已退出，键鼠共享已自动恢复。",
+                        )
+                    };
+                    if let Err(error) = app
+                        .notification()
+                        .builder()
+                        .title(title)
+                        .body(body)
+                        .show()
+                    {
+                        log::warn!("fullscreen notification failed: {error}");
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(FULLSCREEN_POLL_INTERVAL_MS));
+        }
+        FULLSCREEN_APP_ACTIVE.store(false, Ordering::Relaxed);
+    });
+}
+
 #[cfg(target_os = "windows")]
 fn windows_capture_context() -> Option<Arc<WindowsCaptureContext>> {
     WINDOWS_CAPTURE_CONTEXT
@@ -2633,6 +2822,243 @@ fn reset_mouse_move_timer(last_sent: &Mutex<Option<Instant>>) {
 
 fn remote_button_is_down(mask: &AtomicU64) -> bool {
     mask.load(Ordering::Relaxed) != 0
+}
+
+// ---------------------------------------------------------------------------
+// Local drag gate
+//
+// `remote_button_mask` tracks buttons we have *forwarded* to the remote; it
+// says nothing about buttons held while the cursor is still local. Window
+// dragging happens entirely locally, so it needs its own mask. Without it a
+// window shoved into a snap zone satisfies the crossing test (flush against the
+// edge, outward delta) and the pointer teleports away mid-gesture.
+// ---------------------------------------------------------------------------
+
+/// Physical mouse buttons currently held on *this* machine, remote or not.
+static LOCAL_BUTTON_MASK: AtomicU64 = AtomicU64::new(0);
+/// When the pointer first satisfied a crossing while a button was held. Reset
+/// as soon as the pointer stops pressing outward or the button is released.
+static DRAG_EDGE_PRESS_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+/// Settings mirror, refreshed whenever the layout is saved. Kept as atomics so
+/// the hook hot path never has to take the layout lock.
+static DRAG_EDGE_GUARD_ENABLED: AtomicBool = AtomicBool::new(true);
+static DRAG_CROSSING_HOLD: AtomicU64 = AtomicU64::new(DRAG_CROSSING_HOLD_MS);
+static FULLSCREEN_PAUSE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Publishes the scene-awareness settings to the capture hot path.
+pub fn set_scene_guard_settings(drag_guard: bool, drag_hold_ms: u64, fullscreen_pause: bool) {
+    DRAG_EDGE_GUARD_ENABLED.store(drag_guard, Ordering::Relaxed);
+    // Clamp: 0 would silently turn the guard into a no-op, and multi-second
+    // holds read as "the cursor is stuck" to the user.
+    DRAG_CROSSING_HOLD.store(drag_hold_ms.clamp(100, 5_000), Ordering::Relaxed);
+    FULLSCREEN_PAUSE_ENABLED.store(fullscreen_pause, Ordering::Relaxed);
+    if !drag_guard {
+        clear_drag_edge_press();
+    }
+    if !fullscreen_pause {
+        FULLSCREEN_APP_ACTIVE.store(false, Ordering::Relaxed);
+    }
+}
+
+// --- Input smoothing (#11) -------------------------------------------------
+// Two independent, user-toggleable smoothing layers. `MOUSE_SMOOTHING` low-pass
+// filters the per-event movement delta (velocity smoothing) so high-frequency
+// jitter from the capture layer / network coalescing doesn't reach the remote
+// cursor. `SMOOTH_SCROLL` spreads a single wheel tick into a short burst of
+// eased, time-spaced scroll events ("Mos"-style smooth scrolling) on the
+// receiving side. Both mirror `LayoutState` so the setting is live.
+static MOUSE_SMOOTHING: AtomicBool = AtomicBool::new(true);
+static SMOOTH_SCROLL: AtomicBool = AtomicBool::new(true);
+
+/// Publishes the input-smoothing settings to the capture/inject hot paths.
+pub fn set_input_smoothing(mouse: bool, scroll: bool) {
+    MOUSE_SMOOTHING.store(mouse, Ordering::Relaxed);
+    SMOOTH_SCROLL.store(scroll, Ordering::Relaxed);
+}
+
+/// Exponential moving average over the movement delta. `alpha` near 1 tracks
+/// the raw delta closely (minimal smoothing); lower values trail more. Kept at
+/// 0.5 so direction reversals stay responsive while single-event jitter is
+/// damped. Returns the smoothed (dx, dy) for the position accumulator only —
+/// callers must still pass the ORIGINAL delta to edge/crossing detection.
+fn smooth_mouse_delta(dx: f64, dy: f64) -> (f64, f64) {
+    if !MOUSE_SMOOTHING.load(Ordering::Relaxed) {
+        return (dx, dy);
+    }
+    static PREV_DX: Mutex<f64> = Mutex::new(0.0);
+    static PREV_DY: Mutex<f64> = Mutex::new(0.0);
+    const ALPHA: f64 = 0.5;
+    let mut prev_x = PREV_DX.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut prev_y = PREV_DY.lock().unwrap_or_else(|poison| poison.into_inner());
+    let smoothed_x = ALPHA * dx + (1.0 - ALPHA) * *prev_x;
+    let smoothed_y = ALPHA * dy + (1.0 - ALPHA) * *prev_y;
+    *prev_x = smoothed_x;
+    *prev_y = smoothed_y;
+    (smoothed_x, smoothed_y)
+}
+
+/// Receiving-side scroll injection. When smooth scrolling is enabled the tick
+/// is handed to the smoother (time-spaced eased burst); otherwise it is posted
+/// directly. The platform-specific post lives in `post_raw_scroll`.
+pub(crate) fn inject_scroll(delta_x: i32, delta_y: i32) {
+    if SMOOTH_SCROLL.load(Ordering::Relaxed) {
+        scroll_smoothing::enqueue(delta_x, delta_y);
+    } else {
+        post_raw_scroll(delta_x, delta_y);
+    }
+}
+
+/// Platform-specific scroll post. The macOS / Windows bodies mirror the old
+/// per-platform `inject_scroll`; `inject_scroll` (above) is now the shared,
+/// smoothing-aware entry point.
+#[cfg(target_os = "macos")]
+fn post_raw_scroll(delta_x: i32, delta_y: i32) {
+    use core_graphics::{
+        event::{CGEvent, CGEventTapLocation, ScrollEventUnit},
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
+
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        return;
+    };
+    if let Ok(event) =
+        CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)
+    {
+        event.post(CGEventTapLocation::HID);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn post_raw_scroll(delta_x: i32, delta_y: i32) {
+    crate::windows_input::inject_scroll(delta_x, delta_y);
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn post_raw_scroll(_delta_x: i32, _delta_y: i32) {}
+
+/// Spreads one wheel tick into a burst of eased, time-spaced increments so the
+/// receiving OS animates the scroll instead of jumping a whole notch.
+mod scroll_smoothing {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::thread;
+    use std::time::Duration;
+
+    const STEP: f64 = 8.0;
+    const MAX_STEPS: usize = 24;
+    const INTERVAL_MS: u64 = 8;
+
+    static QUEUE: OnceLock<Mutex<VecDeque<(i32, i32)>>> = OnceLock::new();
+    static WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+
+    pub fn enqueue(delta_x: i32, delta_y: i32) {
+        if delta_x == 0 && delta_y == 0 {
+            return;
+        }
+        let magnitude = (delta_y.unsigned_abs().max(delta_x.unsigned_abs())) as f64;
+        let steps = (magnitude / STEP).clamp(1.0, MAX_STEPS as f64).round() as usize;
+        {
+            let queue = QUEUE.get_or_init(|| Mutex::new(VecDeque::new()));
+            let mut queue = match queue.lock() {
+                Ok(queue) => queue,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let mut acc_x = 0i32;
+            let mut acc_y = 0i32;
+            for index in 1..=steps {
+                let t = index as f64 / steps as f64;
+                // Ease-out: most of the travel happens early, then it settles.
+                let eased = 1.0 - (1.0 - t) * (1.0 - t);
+                let target_x = (delta_x as f64 * eased).round() as i32;
+                let target_y = (delta_y as f64 * eased).round() as i32;
+                let step_x = target_x - acc_x;
+                let step_y = target_y - acc_y;
+                acc_x = target_x;
+                acc_y = target_y;
+                if step_x != 0 || step_y != 0 {
+                    queue.push_back((step_x, step_y));
+                }
+            }
+        }
+        ensure_worker();
+    }
+
+    fn ensure_worker() {
+        if WORKER_STARTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        thread::spawn(|| loop {
+            let next = QUEUE
+                .get()
+                .and_then(|queue| queue.lock().ok())
+                .and_then(|mut queue| queue.pop_front());
+            match next {
+                Some((delta_x, delta_y)) => {
+                    super::post_raw_scroll(delta_x, delta_y);
+                    thread::sleep(Duration::from_millis(INTERVAL_MS));
+                }
+                None => thread::sleep(Duration::from_millis(16)),
+            }
+        });
+    }
+}
+
+fn set_local_button(button: MouseButton, down: bool) {
+    let bit = mouse_button_mask(button);
+    if down {
+        LOCAL_BUTTON_MASK.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        LOCAL_BUTTON_MASK.fetch_and(!bit, Ordering::Relaxed);
+        if LOCAL_BUTTON_MASK.load(Ordering::Relaxed) == 0 {
+            clear_drag_edge_press();
+        }
+    }
+}
+
+fn local_button_is_down() -> bool {
+    LOCAL_BUTTON_MASK.load(Ordering::Relaxed) != 0
+}
+
+fn reset_local_button_mask() {
+    LOCAL_BUTTON_MASK.store(0, Ordering::Relaxed);
+    clear_drag_edge_press();
+}
+
+fn clear_drag_edge_press() {
+    if let Ok(mut since) = DRAG_EDGE_PRESS_SINCE.lock() {
+        *since = None;
+    }
+}
+
+/// Gate a would-be crossing that happens while a button is held.
+///
+/// Returns `true` when the crossing may proceed. The first qualifying event
+/// starts a timer; until `DRAG_CROSSING_HOLD_MS` elapses the crossing is
+/// refused, which lets Aero Snap / split-view take the gesture. Keep shoving
+/// past the deadline and the crossing is allowed so dragging content onto the
+/// other machine still works.
+fn drag_crossing_allowed() -> bool {
+    if !DRAG_EDGE_GUARD_ENABLED.load(Ordering::Relaxed) {
+        return true;
+    }
+    if !local_button_is_down() {
+        clear_drag_edge_press();
+        return true;
+    }
+
+    let Ok(mut since) = DRAG_EDGE_PRESS_SINCE.lock() else {
+        // Poisoned lock: fail open rather than wedging the cursor locally.
+        return true;
+    };
+    let hold = Duration::from_millis(DRAG_CROSSING_HOLD.load(Ordering::Relaxed));
+    match *since {
+        Some(started) => started.elapsed() >= hold,
+        None => {
+            *since = Some(Instant::now());
+            false
+        }
+    }
 }
 
 fn update_remote_button_mask(mask: &AtomicU64, button: MouseButton, down: bool) {
@@ -2836,6 +3262,15 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
 
     let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
     let message = wparam as u32;
+
+    // Track physical button state before anything else, and regardless of
+    // whether the remote is active. The drag gate needs to know a button is
+    // held while the cursor is still local — that is exactly the window-drag
+    // case it exists to protect.
+    if let Some((button, down)) = windows_message_to_button(message, event.mouseData) {
+        set_local_button(button, down);
+    }
+
     let handled = match message {
         WM_MOUSEMOVE => handle_windows_mouse_move(&context, event.pt.x as f64, event.pt.y as f64),
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
@@ -3098,8 +3533,9 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             return true;
         }
 
-        active_target.x += dx;
-        active_target.y += dy;
+        let (smoothed_dx, smoothed_dy) = smooth_mouse_delta(dx, dy);
+        active_target.x += smoothed_dx;
+        active_target.y += smoothed_dy;
 
         if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
             let point = local_return_point(active_target);
@@ -3179,8 +3615,19 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         *last_point = Some((x, y));
     }
 
+    // A fullscreen app (typically a game) owns the screen: never pull the
+    // pointer away from it.
+    if fullscreen_app_active() {
+        return false;
+    }
+
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
     if let Some(active_target) = crossing_target(&targets, x, y, dx, dy) {
+        // Dragging into a snap zone must not hand the cursor over. Only a
+        // sustained shove past the edge counts as a deliberate cross.
+        if !drag_crossing_allowed() {
+            return false;
+        }
         let anchor = local_anchor_point(&active_target);
         hide_windows_cursor_if_needed(context);
         set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
@@ -3214,28 +3661,21 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
     false
 }
 
+/// Maps a low-level mouse message to the button it carries. `WM_XBUTTON*`
+/// packs which side button in the high word of `mouseData`.
 #[cfg(target_os = "windows")]
-fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mouse_data: u32) -> bool {
+fn windows_message_to_button(message: u32, mouse_data: u32) -> Option<(MouseButton, bool)> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
         WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1,
     };
 
-    let active = context
-        .active
-        .lock()
-        .ok()
-        .and_then(|active| active.as_ref().cloned());
-    let Some(active_target) = active else {
-        return false;
-    };
-    // WM_XBUTTON* packs which side button in the high word of mouseData.
     let x_button = if (mouse_data >> 16) as u16 == XBUTTON1 as u16 {
         MouseButton::Back
     } else {
         MouseButton::Forward
     };
-    let (button, down) = match message {
+    Some(match message {
         WM_LBUTTONDOWN => (MouseButton::Left, true),
         WM_LBUTTONUP => (MouseButton::Left, false),
         WM_RBUTTONDOWN => (MouseButton::Right, true),
@@ -3244,7 +3684,22 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mo
         WM_MBUTTONUP => (MouseButton::Middle, false),
         WM_XBUTTONDOWN => (x_button, true),
         WM_XBUTTONUP => (x_button, false),
-        _ => return false,
+        _ => return None,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mouse_data: u32) -> bool {
+    let active = context
+        .active
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().cloned());
+    let Some(active_target) = active else {
+        return false;
+    };
+    let Some((button, down)) = windows_message_to_button(message, mouse_data) else {
+        return false;
     };
 
     if !send_remote_mouse_move(
@@ -3414,6 +3869,19 @@ fn handle_macos_event(
         return CallbackResult::Keep;
     }
 
+    // Track physical button state up front, before the active-target check
+    // below can early-return. Window drags happen while the cursor is still
+    // local, so this must run whether or not the remote is engaged.
+    match event_type {
+        CGEventType::LeftMouseDown => set_local_button(MouseButton::Left, true),
+        CGEventType::LeftMouseUp => set_local_button(MouseButton::Left, false),
+        CGEventType::RightMouseDown => set_local_button(MouseButton::Right, true),
+        CGEventType::RightMouseUp => set_local_button(MouseButton::Right, false),
+        CGEventType::OtherMouseDown => set_local_button(MouseButton::Middle, true),
+        CGEventType::OtherMouseUp => set_local_button(MouseButton::Middle, false),
+        _ => {}
+    }
+
     let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as f64;
     let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as f64;
 
@@ -3569,8 +4037,9 @@ fn handle_macos_mouse_move(
             {
                 return CallbackResult::Drop;
             }
-            active_target.x += dx;
-            active_target.y += dy;
+            let (smoothed_dx, smoothed_dy) = smooth_mouse_delta(dx, dy);
+            active_target.x += smoothed_dx;
+            active_target.y += smoothed_dy;
 
             if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
                 let point = local_return_point(active_target);
@@ -3683,6 +4152,11 @@ fn handle_macos_mouse_move(
     if let Some(active_target) =
         mac_crossing_target(context, &targets, location.x, location.y, dx, dy)
     {
+        // Dragging a window into a split-view / snap hot zone must not hand the
+        // cursor to the remote. Only a sustained shove past the edge counts.
+        if !drag_crossing_allowed() {
+            return CallbackResult::Keep;
+        }
         let anchor = mac_cursor_point(
             context,
             local_anchor_point(&active_target),
@@ -4435,6 +4909,12 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
         Err(_) => return,
     };
     let Some(direction) = direction else { return };
+    // Fullscreen app in front: swallow the request rather than queueing it, so
+    // a stray hotkey during a game does not fire the moment the game exits.
+    if fullscreen_app_active() {
+        log::debug!("screen switch {direction:?} ignored: fullscreen app active");
+        return;
+    }
     let current_point = windows_current_cursor_point();
     match request_screen_switch_from_point(
         direction,
@@ -5678,23 +6158,6 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn inject_scroll(delta_x: i32, delta_y: i32) {
-    use core_graphics::{
-        event::{CGEvent, CGEventTapLocation, ScrollEventUnit},
-        event_source::{CGEventSource, CGEventSourceStateID},
-    };
-
-    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
-        return;
-    };
-    if let Ok(event) =
-        CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)
-    {
-        event.post(CGEventTapLocation::HID);
-    }
-}
-
 /// Held modifier flags to stamp on injected macOS events. Posting a bare
 /// modifier *keycode* does not make the window server apply that modifier to the
 /// key events posted after it, so capitals, shifted symbols and every shortcut
@@ -5875,11 +6338,6 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
 }
 
 #[cfg(target_os = "windows")]
-fn inject_scroll(delta_x: i32, delta_y: i32) {
-    crate::windows_input::inject_scroll(delta_x, delta_y);
-}
-
-#[cfg(target_os = "windows")]
 fn inject_key(key_code: u16, down: bool) {
     crate::windows_input::inject_key(key_code, down);
 }
@@ -5891,14 +6349,71 @@ fn inject_mouse_move(_x: i32, _y: i32, _drag_button: Option<MouseButton>) {}
 fn inject_mouse_button(_button: MouseButton, _down: bool, _x: i32, _y: i32) {}
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn inject_scroll(_delta_x: i32, _delta_y: i32) {}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn inject_key(_key_code: u16, _down: bool) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The drag gate lives in process-wide statics, so every assertion about it
+    // runs inside one test to keep the ordering deterministic under the
+    // parallel test harness.
+    #[test]
+    fn drag_gate_blocks_snap_gestures_but_allows_a_sustained_shove() {
+        reset_local_button_mask();
+
+        // No button held: crossings are never gated.
+        assert!(
+            drag_crossing_allowed(),
+            "a plain cursor move must cross freely"
+        );
+
+        // Button down — this is the window-drag / snap-to-edge case. The first
+        // qualifying event only arms the timer, it must not cross.
+        set_local_button(MouseButton::Left, true);
+        assert!(
+            !drag_crossing_allowed(),
+            "dragging into the edge must not hand the cursor to the remote"
+        );
+        assert!(
+            !drag_crossing_allowed(),
+            "still inside the hold window: keep refusing"
+        );
+
+        // Releasing the button clears the timer, so the next drag starts fresh
+        // instead of inheriting a nearly-elapsed deadline.
+        set_local_button(MouseButton::Left, false);
+        assert!(drag_crossing_allowed(), "release re-opens the gate");
+        assert!(
+            DRAG_EDGE_PRESS_SINCE.lock().unwrap().is_none(),
+            "release must clear the armed timer"
+        );
+
+        // Keep shoving past the deadline and the crossing is allowed — this is
+        // what preserves dragging content onto the other machine.
+        set_local_button(MouseButton::Left, true);
+        assert!(!drag_crossing_allowed(), "arms the timer");
+        *DRAG_EDGE_PRESS_SINCE.lock().unwrap() =
+            Some(Instant::now() - Duration::from_millis(DRAG_CROSSING_HOLD_MS + 10));
+        assert!(
+            drag_crossing_allowed(),
+            "a sustained shove past the hold window must cross"
+        );
+
+        // Multiple buttons: the gate stays armed until the last one is up.
+        reset_local_button_mask();
+        set_local_button(MouseButton::Left, true);
+        set_local_button(MouseButton::Right, true);
+        set_local_button(MouseButton::Left, false);
+        assert!(
+            local_button_is_down(),
+            "right button is still held, drag is still in progress"
+        );
+        set_local_button(MouseButton::Right, false);
+        assert!(!local_button_is_down(), "all buttons released");
+
+        reset_local_button_mask();
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -6058,6 +6573,11 @@ mod tests {
             modifier_map: crate::default_modifier_map(),
             edge_switch_hotkey: crate::default_edge_switch_hotkey(),
             screen_switch_hotkeys: crate::ScreenSwitchHotkeys::default(),
+            drag_edge_guard: true,
+            drag_crossing_hold_ms: 800,
+            fullscreen_pause: true,
+            mouse_smoothing: true,
+            smooth_scroll: true,
         }
     }
 

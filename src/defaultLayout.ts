@@ -33,6 +33,11 @@ export const defaultLayout: LayoutState = {
   modifierMap: { control: 'meta', alt: 'same', meta: 'control' },
   edgeSwitchHotkey: 'alt+shift+k',
   screenSwitchHotkeys: { left: 'alt+left', right: 'alt+right', up: 'alt+up', down: 'alt+down' },
+  dragEdgeGuard: true,
+  dragCrossingHoldMs: 800,
+  fullscreenPause: true,
+  mouseSmoothing: true,
+  smoothScroll: true,
   devices: [
     {
       id: 'local-device',
