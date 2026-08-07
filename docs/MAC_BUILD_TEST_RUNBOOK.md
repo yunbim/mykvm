@@ -20,16 +20,40 @@ rustup target add aarch64-apple-darwin
 node -v
 ```
 
+> ⚠️ **复制粘贴注意**：本文档的命令写在 ``` 代码块里，**只复制块内的命令行**，
+> 不要把开头的 ```` ```bash ```` 和结尾的 ```` ``` ```` 一起粘进终端。反引号在 shell 里是
+> 「命令替换」，整块粘进去会启动一个 `bash` 子 shell（提示符变成 `bash-3.2$`），
+> 命令根本没执行。已经中招的话按 `Ctrl-D` 或输入 `exit` 退回 zsh 即可。
+
 ## 1. 拉取代码
 
+首次 clone（**在家目录执行，不要先 `mkdir ~/mykvm` 再进去 clone**，否则会得到嵌套的
+`~/mykvm/mykvm`）：
+
 ```bash
+cd ~
 git clone git@github.com:yunbim/mykvm.git
-cd mykvm
-# 已 clone 过就直接更新：
+cd ~/mykvm
+```
+
+已经 clone 过就直接更新：
+
+```bash
+cd ~/mykvm
 git fetch origin && git checkout main && git pull --ff-only
 ```
 
+确认拿到的是最新版（应输出 `0.1.1` 和对应 commit）：
+
+```bash
+git log --oneline -1
+node -p "require('./package.json').version"
+```
+
 ## 2. 编译 + 安装（一条命令）
+
+先确认工具链就位：`node -v` ≥ 20，`rustup target list --installed | grep darwin`
+应含 `aarch64-apple-darwin`。
 
 ```bash
 npm ci
