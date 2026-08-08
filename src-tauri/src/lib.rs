@@ -42,8 +42,8 @@ const TRANSPORT_PORT_MAX: u16 = 65_535;
 // ports starting from the configured base, so two peers that landed on different
 // ports (e.g. 47833 and 47834) still reach each other.
 const DISCOVERY_PORT_SPAN: u16 = 8;
-const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
-const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
+const REPOSITORY_URL: &str = "https://github.com/yunbim/mykvm";
+const RELEASES_URL: &str = "https://github.com/yunbim/mykvm/releases/latest";
 const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
 // UDP discovery is a heartbeat, not the transport itself. Keep peers through
 // short announce gaps so online clients do not flicker offline in the UI.

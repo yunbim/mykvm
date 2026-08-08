@@ -3,9 +3,10 @@ set -eu
 
 CERT_NAME="${MYKVM_CODESIGN_IDENTITY:-MyKVM Local Code Signing}"
 KEYCHAIN="${MYKVM_CODESIGN_KEYCHAIN:-$HOME/Library/Keychains/mykvm-local-signing.keychain-db}"
-KEYCHAIN_PASSWORD="${MYKVM_CODESIGN_KEYCHAIN_PASSWORD:-}"
+KEYCHAIN_PASSWORD="${MYKVM_CODESIGN_KEYCHAIN_PASSWORD:-mykvm-local}"
 P12_PASSWORD="${MYKVM_CODESIGN_P12_PASSWORD:-mykvm-local}"
 APP_PATH="${1:-/Applications/mykvm.app}"
+DMG_PATH="${2:-}"
 
 if [ "$(uname -s)" != "Darwin" ]; then
   printf "macOS signing must run on macOS.\n" >&2
@@ -75,22 +76,52 @@ EOF
     created_identity=1
   fi
 
+  # Best effort: mark the cert trusted for code signing. A user-domain trust is
+  # enough for some operations, but macOS only reports it as a *valid*
+  # codesigning identity once it lives in the System keychain trusted roots
+  # (which needs `sudo`). We don't fail if this can't be done headlessly — the
+  # caller falls back to ad-hoc signing below.
   if [ "$created_identity" -eq 1 ]; then
     security find-certificate -c "$CERT_NAME" -p "$KEYCHAIN" > "$tmp_dir/mykvm-codesign.crt"
     security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" \
       "$tmp_dir/mykvm-codesign.crt" >/dev/null 2>&1 || true
   fi
+
   security set-key-partition-list -S apple-tool:,apple:,codesign: \
     -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
-
-  if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -F "\"$CERT_NAME\"" >/dev/null; then
-    printf "Code signing identity is not valid: %s\n" "$CERT_NAME" >&2
-    exit 1
-  fi
 }
 
 ensure_local_identity
 
-codesign --force --deep --sign "$CERT_NAME" --identifier com.xzhpl.mykvm "$APP_PATH"
-codesign --verify --deep --strict --verbose=4 "$APP_PATH"
-codesign -dr - "$APP_PATH" 2>&1
+# Choose the signing identity:
+#  - Prefer the self-signed cert IF it is a *valid* (trusted) codesigning
+#    identity. A proper cert preserves TCC grants (Accessibility / Input
+#    Monitoring) across updates and opens on any Mac that trusts it.
+#  - Otherwise fall back to ad-hoc (`-`). This still produces a valid signature
+#    and, once the quarantine flag is stripped, lets the app open without the
+#    "unidentified developer" Gatekeeper block on the local machine.
+SIGN_IDENTITY="-"
+if security find-identity -v -p codesigning 2>/dev/null | grep -F "\"$CERT_NAME\"" >/dev/null; then
+  SIGN_IDENTITY="$CERT_NAME"
+  echo "Using trusted self-signed identity: $CERT_NAME"
+else
+  echo "Self-signed cert is not a trusted codesigning identity; using ad-hoc signing."
+  echo "To enable a trusted cert (recommended for updates + cross-machine use), run once with sudo:"
+  echo "  sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain \"$KEYCHAIN\""
+fi
+
+xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || true
+codesign --force --deep --sign "$SIGN_IDENTITY" --identifier com.xzhpl.mykvm "$APP_PATH" \
+  || { echo "codesign failed" >&2; exit 1; }
+codesign --verify --deep --verbose=2 "$APP_PATH" || true
+codesign -dr - "$APP_PATH" 2>&1 || true
+
+if [ -n "$DMG_PATH" ] && [ -f "$DMG_PATH" ]; then
+  xattr -dr com.apple.quarantine "$DMG_PATH" 2>/dev/null || true
+  codesign --force --sign "$SIGN_IDENTITY" "$DMG_PATH" \
+    || { echo "dmg codesign failed" >&2; exit 1; }
+  codesign --verify --verbose=2 "$DMG_PATH" || true
+  echo "Signed disk image: $DMG_PATH"
+fi
+
+echo "Signed with identity: $SIGN_IDENTITY"

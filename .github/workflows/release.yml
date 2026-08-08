@@ -282,7 +282,9 @@ jobs:
           if [ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
             npm exec -- tauri signer sign "$probe" --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" >/dev/null
           else
-            npm exec -- tauri signer sign "$probe" >/dev/null
+            # No password: pass an empty one so `tauri signer` does not block on
+            # an interactive prompt (which would hang a headless runner).
+            npm exec -- tauri signer sign "$probe" --password "" >/dev/null
           fi
 
           PROBE="$probe" node <<'NODE'
@@ -338,7 +340,7 @@ jobs:
             data.version = version;
             if (file === 'src-tauri/tauri.conf.json' && channel === 'beta') {
               data.plugins.updater.endpoints = [
-                'https://github.com/XxMinor/mykvm/releases/download/beta/latest.json',
+                'https://github.com/yunbim/mykvm/releases/download/beta/latest.json',
               ];
             }
             fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);

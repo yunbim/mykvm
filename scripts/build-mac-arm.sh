@@ -11,6 +11,9 @@ fi
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# 自签身份名称：与 scripts/sign-mac-app.sh 保持一致。
+export MYKVM_CODESIGN_IDENTITY="${MYKVM_CODESIGN_IDENTITY:-MyKVM Local Code Signing}"
+
 rustup target add aarch64-apple-darwin || true
 npm install
 
@@ -27,22 +30,62 @@ npm install
 # 且 RUSTFLAGS 真正对所有 crate (含 proc-macro) 生效。
 export RUSTFLAGS="-C link-arg=-fuse-ld=$(rustc --print sysroot)/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld64.lld"
 
+# 若有更新签名私钥 (ed25519), 本地构建在打安装包之余, 也给 .app.tar.gz 更新产物
+# 补上 .sig, 便于自测应用内更新。真正的发布签名由 CI (release.yml) 完成。
+UPDATER_KEY="$HOME/.mykvm/updater.key"
+
 # 清掉旧的 dist: 用 mv 而非 rm, 避免某些 CI / 沙箱环境的批量删除护栏拦截 rm。
 [ -d dist ] && mv dist "/tmp/mykvm-dist-bak-$(date +%s)" 2>/dev/null || true
 
-npm exec tauri build -- --no-sign
+# 仅打 app (再自行打包 dmg), 用 --no-sign 让 Tauri 不尝试 Apple 签名,
+# 后面由 sign-mac-app.sh 用本地自签身份 / 回退 ad-hoc 签名。
+npm exec tauri build -- --no-sign --bundles app
 
-# Tauri 在沙箱 / 受限环境下, dmg 末步的 bundle_dmg.sh 可能因 hdiutil 受限而失败。
-# 此时 .app 已生成, 且存在 rw.*.dmg 中间映像, 这里兜底把它转成最终压缩 dmg。
+APP_PATH="src-tauri/target/release/bundle/macos/mykvm.app"
 VERSION=$(node -p "require('./package.json').version")
 DMG_DIR="src-tauri/target/release/bundle/dmg"
-MACOS_DIR="src-tauri/target/release/bundle/macos"
-RW_DMG=$(ls -t "$MACOS_DIR"/rw.*.dmg 2>/dev/null | head -n 1 || true)
-if [ -n "$RW_DMG" ]; then
-  if ! ls "$DMG_DIR"/*.dmg >/dev/null 2>&1; then
-    mkdir -p "$DMG_DIR"
-    hdiutil convert "$RW_DMG" -format UDZO -o "$DMG_DIR/mykvm_${VERSION}_aarch64.dmg" || true
+DMG_PATH="$DMG_DIR/mykvm_${VERSION}_aarch64.dmg"
+TARGZ_PATH="src-tauri/target/release/bundle/macos/mykvm.app.tar.gz"
+
+# 1) 自签 .app (首次运行会在本地钥匙串生成并信任自签证书, 不可信时回退 ad-hoc)。
+"$(dirname "$0")/sign-mac-app.sh" "$APP_PATH"
+
+# 2) 从「已签名的 .app」重新生成 dmg, 使 dmg 内嵌的是签名后的 app,
+#    再对 dmg 自身签名并去掉 quarantine。
+rm -rf "$DMG_DIR"
+mkdir -p "$DMG_DIR"
+STAGING="$(mktemp -d)"
+trap 'rm -rf "$STAGING"' EXIT HUP INT TERM
+cp -R "$APP_PATH" "$STAGING/mykvm.app"
+ln -s /Applications "$STAGING/Applications"
+
+if hdiutil create -volname mykvm -srcfolder "$STAGING" -ov -format UDZO -o "$DMG_PATH" 2>/dev/null; then
+  :
+else
+  # 兜底: 若 hdiutil create 受限失败, 退回转换 Tauri 可能残留的 rw.*.dmg
+  # (此时内嵌 app 仍是未签名版, install 脚本会重新签名, 仅影响下载分发场景)。
+  RW_DMG=$(ls -t src-tauri/target/release/bundle/macos/rw.*.dmg 2>/dev/null | head -n 1 || true)
+  if [ -n "$RW_DMG" ]; then
+    hdiutil convert "$RW_DMG" -format UDZO -o "$DMG_PATH" || true
+  fi
+fi
+rm -rf "$STAGING"
+
+# 3) 对 dmg 签名 (同时再次确认 app 签名, 幂等)。
+if [ -f "$DMG_PATH" ]; then
+  "$(dirname "$0")/sign-mac-app.sh" "$APP_PATH" "$DMG_PATH"
+fi
+
+# 4) 若提供了更新私钥, 给 .app.tar.gz 更新产物补上 .sig (--no-sign 会跳过此步)。
+#    无密码的密钥需显式传 --password "" 以跳过交互式密码提示。
+if [ -f "$UPDATER_KEY" ] && [ -f "$TARGZ_PATH" ]; then
+  TAURI_SIGNING_PRIVATE_KEY="$(cat "$UPDATER_KEY")" \
+    npm exec -- tauri signer sign "$TARGZ_PATH" --password "" 2>&1 | tail -3
+  if [ -f "$TARGZ_PATH.sig" ]; then
+    echo "Signed updater artifact: $TARGZ_PATH.sig"
+  else
+    echo "WARN: 本地更新产物签名失败 (可忽略, 发布由 CI 签名); 见上方错误。"
   fi
 fi
 
-echo "Done. .app 与 .dmg 位于 src-tauri/target/release/bundle/"
+echo "Done. 自签名 .app / .dmg / 更新产物位于 src-tauri/target/release/bundle/"

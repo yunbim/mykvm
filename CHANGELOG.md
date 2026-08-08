@@ -14,6 +14,10 @@ release will reuse them).
 - **Pause for specific apps.** You can now list the apps that should pause input sharing (a bundle id on macOS, an executable name on Windows). Once the list has anything in it, it fully replaces the old "pause for any fullscreen app" rule, so watching a fullscreen video or using a fullscreen browser no longer steals the pointer back. Leave the list empty to keep the previous fullscreen behaviour.
 - **Reverse scroll direction.** A per-machine toggle that makes content follow your finger, the way macOS "natural scrolling" does — handy when the two machines disagree about scroll direction.
 
+### Changed
+
+- **Self-signed macOS builds + in-app updater now target your fork.** `scripts/build-mac-arm.sh` self-signs the `.app`/`.dmg` so they open without the "unidentified developer" Gatekeeper block (ad-hoc by default; run the printed `sudo` one-liner once to enable a trusted cert that also preserves Accessibility / Input Monitoring grants across updates). The Tauri updater endpoint and public key now point at `yunbim/mykvm` instead of the upstream repo, so in-app updates fetch and verify against your own releases.
+
 ### Fixed
 
 - **macOS Secure Keyboard Entry no longer spams on launch.** Detection is now on-demand and fails silently / shows a single non-blocking notice instead of a recurring modal that could lock the UI.
