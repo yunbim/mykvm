@@ -96,12 +96,39 @@ export interface LayoutState {
   /** Low-pass filter the per-event movement delta so jitter doesn't reach the
    *  remote cursor. */
   mouseSmoothing: boolean
-  /** Spread a wheel tick into a short burst of eased scroll events for
-   *  "Mos"-style smooth scrolling on the receiving side. */
+  /** Spread a wheel tick into a short burst of eased scroll events when this
+   *  machine is the one being scrolled. Windows only — macOS has its own
+   *  engine below. */
   smoothScroll: boolean
-  /** Invert the wheel direction before it is injected on the receiving side. */
+  /** Invert the wheel direction before it is injected on this machine.
+   *  Windows only, for the same reason. */
   reverseScroll: boolean
   /** Bundle ids (macOS) or executable names (Windows) that suspend sharing
    *  while they own the foreground. Empty means "no app-specific pause". */
   pauseAppWhitelist: string[]
+  /** macOS local scroll engine. Applies to the wheel on *this* Mac — both when
+   *  scrolling it directly and when it is being driven from the other machine —
+   *  so it is intentionally never synced to the peer. */
+  macosScroll: MacScrollConfig
+}
+
+export type MacScrollConfig = {
+  /** Master switch for interpolated scrolling. */
+  smooth: boolean
+  /** Natural / reversed wheel direction. */
+  reverse: boolean
+  /** Hold Option to scroll faster. */
+  optionAccelerate: boolean
+  optionFactor: number
+  /** Hold Shift to scroll horizontally. */
+  shiftHorizontal: boolean
+  /** Hold Command to pass the wheel through untouched, so Cmd+wheel zoom
+   *  keeps its modifier. */
+  commandBypass: boolean
+  /** Pixels per detent, before `speed`. */
+  step: number
+  speed: number
+  /** Per-frame interpolation factor: lower glides longer. */
+  transition: number
+  intervalMs: number
 }

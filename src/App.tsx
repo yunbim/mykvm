@@ -77,6 +77,7 @@ import type {
   AppLanguage,
   Device,
   LayoutState,
+  MacScrollConfig,
   MachineRole,
   ModifierMap,
   ModifierTarget,
@@ -85,6 +86,11 @@ import type {
   ThemeMode,
   TransportPortMode,
 } from "./types";
+import { defaultLayout } from "./defaultLayout";
+
+/** Fallback for layouts written before the macOS scroll block existed, and the
+ *  target of the "reset to defaults" button. */
+const DEFAULT_MAC_SCROLL: MacScrollConfig = defaultLayout.macosScroll;
 
 const DEFAULT_BOARD_WIDTH = 1040;
 const DEFAULT_BOARD_HEIGHT = 640;
@@ -222,6 +228,12 @@ function App() {
   const [isPortable, setIsPortable] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // Messages the user has explicitly dismissed. The runtime status is polled
+  // every 2s, so without this a persistent condition (missing Accessibility
+  // permission, a stubborn native stage) re-raised the modal the instant it was
+  // closed and the whole window became unusable. Dismissing is remembered for
+  // the session; a *different* message still gets through.
+  const dismissedErrorsRef = useRef<Set<string>>(new Set());
   const [isCapturingEdgeSwitchHotkey, setIsCapturingEdgeSwitchHotkey] =
     useState(false);
   const [capturingDirection, setCapturingDirection] = useState<
@@ -545,14 +557,20 @@ function App() {
               .catch(() => {});
           }
 
-          // Keep a persistent blocking condition visible. The inject stage holds
+          // Surface a persistent blocking condition once. The inject stage holds
           // the receiver-side reason keys/clicks get dropped (macOS Accessibility
-          // missing, or Secure Keyboard Entry on); it is otherwise never shown.
+          // not granted); it is otherwise never shown. Anything the user already
+          // dismissed stays dismissed — this poll runs every 2s and used to
+          // resurrect the modal faster than it could be closed.
           if (nextRuntime.started) {
-            if (nextRuntime.capture.state === "error") {
-              setErrorMessage(nextRuntime.capture.detail);
-            } else if (nextRuntime.inject.state === "error") {
-              setErrorMessage(nextRuntime.inject.detail);
+            const blocking =
+              nextRuntime.capture.state === "error"
+                ? nextRuntime.capture.detail
+                : nextRuntime.inject.state === "error"
+                  ? nextRuntime.inject.detail
+                  : null;
+            if (blocking && !dismissedErrorsRef.current.has(blocking)) {
+              setErrorMessage(blocking);
             }
           }
         })
@@ -666,6 +684,12 @@ function App() {
     navigator.platform.toLowerCase();
   const metaKeyLabel = metaKeyLabelForPlatform(localPlatform);
   const usesWindowsChrome = localPlatform.includes("win");
+  // Scroll behaviour is a property of the machine being scrolled, so the macOS
+  // engine renders on the Mac regardless of whether it is the server or the
+  // client — and the generic scroll toggles hide there to avoid two competing
+  // sources of truth.
+  const isMacos = localPlatform.includes("mac");
+  const macScroll = layout?.macosScroll ?? DEFAULT_MAC_SCROLL;
   const inputServiceInstalled = Boolean(runtime?.inputService.installed);
   const inputServiceReady =
     inputServiceInstalled &&
@@ -1110,6 +1134,9 @@ function App() {
   async function setRuntimeState(nextStarted: boolean) {
     setIsRuntimePending(true);
     setErrorMessage(null);
+    // An explicit start/stop is the user asking "why isn't this working?", so
+    // previously dismissed blocking reasons are allowed to surface again.
+    dismissedErrorsRef.current.clear();
 
     try {
       const nextRuntime = nextStarted
@@ -1453,6 +1480,25 @@ function App() {
     updateLayout((layoutState) => ({
       ...layoutState,
       reverseScroll,
+    }));
+  }
+
+  /** Patches one field of the macOS scroll engine config. The block is a single
+   *  nested object so a partial update has to merge rather than replace. */
+  function updateMacScroll(patch: Partial<MacScrollConfig>) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      macosScroll: {
+        ...(layoutState.macosScroll ?? DEFAULT_MAC_SCROLL),
+        ...patch,
+      },
+    }));
+  }
+
+  function resetMacScroll() {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      macosScroll: { ...DEFAULT_MAC_SCROLL },
     }));
   }
 
@@ -1940,6 +1986,11 @@ function App() {
     void openUpdateReleasePage();
   }
 
+  function dismissErrorDialog(message: string) {
+    dismissedErrorsRef.current.add(message);
+    setErrorMessage(null);
+  }
+
   function renderErrorDialog(message: string) {
     const canRelaunch = shouldOfferPermissionRelaunch(message);
 
@@ -1949,7 +2000,7 @@ function App() {
           <button
             type="button"
             className="error-dialog-close"
-            onClick={() => setErrorMessage(null)}
+            onClick={() => dismissErrorDialog(message)}
             aria-label={ui.errors.close}
             title={ui.errors.close}
           >
@@ -2800,33 +2851,35 @@ function App() {
                     </span>
                   </span>
                 </div>
-                <div className="settings-control-row">
-                  <span>
-                    {ui.settings.fullscreenPause}
-                    <span className="info-tooltip-host" tabIndex={0}>
-                      ⓘ
-                      <span className="info-tooltip">
-                        {ui.settings.fullscreenPauseCopy}
+                {machineRole === "server" && (
+                  <div className="settings-control-row">
+                    <span>
+                      {ui.settings.fullscreenPause}
+                      <span className="info-tooltip-host" tabIndex={0}>
+                        ⓘ
+                        <span className="info-tooltip">
+                          {ui.settings.fullscreenPauseCopy}
+                        </span>
                       </span>
                     </span>
-                  </span>
-                  <div className="segmented-control">
-                    <button
-                      type="button"
-                      className={layout.fullscreenPause ? "active" : ""}
-                      onClick={() => setFullscreenPause(true)}
-                    >
-                      {ui.common.enabled}
-                    </button>
-                    <button
-                      type="button"
-                      className={!layout.fullscreenPause ? "active" : ""}
-                      onClick={() => setFullscreenPause(false)}
-                    >
-                      {ui.common.disabled}
-                    </button>
+                    <div className="segmented-control">
+                      <button
+                        type="button"
+                        className={layout.fullscreenPause ? "active" : ""}
+                        onClick={() => setFullscreenPause(true)}
+                      >
+                        {ui.common.enabled}
+                      </button>
+                      <button
+                        type="button"
+                        className={!layout.fullscreenPause ? "active" : ""}
+                        onClick={() => setFullscreenPause(false)}
+                      >
+                        {ui.common.disabled}
+                      </button>
+                    </div>
                   </div>
-                </div>
+                )}
                 <div className="settings-control-row">
                   <span>
                     {ui.settings.mouseSmoothing}
@@ -2854,119 +2907,125 @@ function App() {
                     </button>
                   </div>
                 </div>
-                <div className="settings-control-row">
-                  <span>
-                    {ui.settings.smoothScroll}
-                    <span className="info-tooltip-host" tabIndex={0}>
-                      ⓘ
-                      <span className="info-tooltip">
-                        {ui.settings.smoothScrollCopy}
+                {isMacos ? null : (
+                  <>
+                    <div className="settings-control-row">
+                      <span>
+                        {ui.settings.smoothScroll}
+                        <span className="info-tooltip-host" tabIndex={0}>
+                          ⓘ
+                          <span className="info-tooltip">
+                            {ui.settings.smoothScrollCopy}
+                          </span>
+                        </span>
                       </span>
-                    </span>
-                  </span>
-                  <div className="segmented-control">
-                    <button
-                      type="button"
-                      className={layout.smoothScroll ? "active" : ""}
-                      onClick={() => setSmoothScroll(true)}
-                    >
-                      {ui.common.enabled}
-                    </button>
-                    <button
-                      type="button"
-                      className={!layout.smoothScroll ? "active" : ""}
-                      onClick={() => setSmoothScroll(false)}
-                    >
-                      {ui.common.disabled}
-                    </button>
-                  </div>
-                </div>
-                <div className="settings-control-row">
-                  <span>
-                    {ui.settings.reverseScroll}
-                    <span className="info-tooltip-host" tabIndex={0}>
-                      ⓘ
-                      <span className="info-tooltip">
-                        {ui.settings.reverseScrollCopy}
-                      </span>
-                    </span>
-                  </span>
-                  <div className="segmented-control">
-                    <button
-                      type="button"
-                      className={layout.reverseScroll ? "active" : ""}
-                      onClick={() => setReverseScroll(true)}
-                    >
-                      {ui.common.enabled}
-                    </button>
-                    <button
-                      type="button"
-                      className={!layout.reverseScroll ? "active" : ""}
-                      onClick={() => setReverseScroll(false)}
-                    >
-                      {ui.common.disabled}
-                    </button>
-                  </div>
-                </div>
-                <div className="settings-control-row settings-control-row-stacked">
-                  <span>
-                    {ui.settings.pauseWhitelist}
-                    <span className="info-tooltip-host" tabIndex={0}>
-                      ⓘ
-                      <span className="info-tooltip">
-                        {ui.settings.pauseWhitelistCopy}
-                      </span>
-                    </span>
-                  </span>
-                  <div className="pause-whitelist">
-                    <div className="pause-whitelist-input">
-                      <input
-                        type="text"
-                        className="settings-number-input"
-                        value={pauseAppDraft}
-                        placeholder={ui.settings.pauseWhitelistPlaceholder}
-                        onChange={(event) =>
-                          setPauseAppDraft(event.target.value)
-                        }
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter") {
-                            event.preventDefault();
-                            addPauseApp(pauseAppDraft);
-                          }
-                        }}
-                      />
-                      <button
-                        type="button"
-                        className="secondary-button compact-button"
-                        disabled={!pauseAppDraft.trim()}
-                        onClick={() => addPauseApp(pauseAppDraft)}
-                      >
-                        {ui.settings.pauseWhitelistAdd}
-                      </button>
+                      <div className="segmented-control">
+                        <button
+                          type="button"
+                          className={layout.smoothScroll ? "active" : ""}
+                          onClick={() => setSmoothScroll(true)}
+                        >
+                          {ui.common.enabled}
+                        </button>
+                        <button
+                          type="button"
+                          className={!layout.smoothScroll ? "active" : ""}
+                          onClick={() => setSmoothScroll(false)}
+                        >
+                          {ui.common.disabled}
+                        </button>
+                      </div>
                     </div>
-                    {(layout.pauseAppWhitelist ?? []).length === 0 ? (
-                      <p className="settings-hint">
-                        {ui.settings.pauseWhitelistEmpty}
-                      </p>
-                    ) : (
-                      <ul className="pause-whitelist-items">
-                        {(layout.pauseAppWhitelist ?? []).map((entry) => (
-                          <li key={entry}>
-                            <span title={entry}>{entry}</span>
-                            <button
-                              type="button"
-                              className="secondary-button compact-button danger-button"
-                              aria-label={`${ui.settings.pauseWhitelistRemove} ${entry}`}
-                              onClick={() => removePauseApp(entry)}
-                            >
-                              ×
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
+                    <div className="settings-control-row">
+                      <span>
+                        {ui.settings.reverseScroll}
+                        <span className="info-tooltip-host" tabIndex={0}>
+                          ⓘ
+                          <span className="info-tooltip">
+                            {ui.settings.reverseScrollCopy}
+                          </span>
+                        </span>
+                      </span>
+                      <div className="segmented-control">
+                        <button
+                          type="button"
+                          className={layout.reverseScroll ? "active" : ""}
+                          onClick={() => setReverseScroll(true)}
+                        >
+                          {ui.common.enabled}
+                        </button>
+                        <button
+                          type="button"
+                          className={!layout.reverseScroll ? "active" : ""}
+                          onClick={() => setReverseScroll(false)}
+                        >
+                          {ui.common.disabled}
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
+                {machineRole === "server" && (
+                  <div className="settings-control-row settings-control-row-stacked">
+                    <span>
+                      {ui.settings.pauseWhitelist}
+                      <span className="info-tooltip-host" tabIndex={0}>
+                        ⓘ
+                        <span className="info-tooltip">
+                          {ui.settings.pauseWhitelistCopy}
+                        </span>
+                      </span>
+                    </span>
+                    <div className="pause-whitelist">
+                      <div className="pause-whitelist-input">
+                        <input
+                          type="text"
+                          className="settings-number-input"
+                          value={pauseAppDraft}
+                          placeholder={ui.settings.pauseWhitelistPlaceholder}
+                          onChange={(event) =>
+                            setPauseAppDraft(event.target.value)
+                          }
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              addPauseApp(pauseAppDraft);
+                            }
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="secondary-button compact-button"
+                          disabled={!pauseAppDraft.trim()}
+                          onClick={() => addPauseApp(pauseAppDraft)}
+                        >
+                          {ui.settings.pauseWhitelistAdd}
+                        </button>
+                      </div>
+                      {(layout.pauseAppWhitelist ?? []).length === 0 ? (
+                        <p className="settings-hint">
+                          {ui.settings.pauseWhitelistEmpty}
+                        </p>
+                      ) : (
+                        <ul className="pause-whitelist-items">
+                          {(layout.pauseAppWhitelist ?? []).map((entry) => (
+                            <li key={entry}>
+                              <span title={entry}>{entry}</span>
+                              <button
+                                type="button"
+                                className="secondary-button compact-button danger-button"
+                                aria-label={`${ui.settings.pauseWhitelistRemove} ${entry}`}
+                                onClick={() => removePauseApp(entry)}
+                              >
+                                ×
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
                   </div>
-                </div>
+                )}
                 <div className="settings-control-row">
                   <span>{ui.settings.clipboard}</span>
                   <div className="segmented-control">
@@ -3038,6 +3097,120 @@ function App() {
                   </div>
                 ) : null}
               </section>
+
+              {isMacos ? (
+                <section className="surface-card">
+                  <div className="card-title-row">
+                    <h2>{ui.settings.macScrollTitle}</h2>
+                    <button
+                      type="button"
+                      className="secondary-button compact-button"
+                      onClick={resetMacScroll}
+                    >
+                      {ui.settings.macScrollReset}
+                    </button>
+                  </div>
+                  <p className="settings-hint">{ui.settings.macScrollCopy}</p>
+                  <SettingsToggleRow
+                    label={ui.settings.macScrollSmooth}
+                    copy={ui.settings.macScrollSmoothCopy}
+                    value={macScroll.smooth}
+                    enabledLabel={ui.common.enabled}
+                    disabledLabel={ui.common.disabled}
+                    onChange={(smooth) => updateMacScroll({ smooth })}
+                  />
+                  <SettingsToggleRow
+                    label={ui.settings.macScrollReverse}
+                    copy={ui.settings.macScrollReverseCopy}
+                    value={macScroll.reverse}
+                    enabledLabel={ui.common.enabled}
+                    disabledLabel={ui.common.disabled}
+                    onChange={(reverse) => updateMacScroll({ reverse })}
+                  />
+                  <SettingsToggleRow
+                    label={ui.settings.macScrollOptionAccelerate}
+                    copy={ui.settings.macScrollOptionAccelerateCopy}
+                    value={macScroll.optionAccelerate}
+                    enabledLabel={ui.common.enabled}
+                    disabledLabel={ui.common.disabled}
+                    onChange={(optionAccelerate) =>
+                      updateMacScroll({ optionAccelerate })
+                    }
+                  />
+                  <SettingsNumberRow
+                    label={ui.settings.macScrollOptionFactor}
+                    copy={ui.settings.macScrollOptionAccelerateCopy}
+                    value={macScroll.optionFactor}
+                    min={1}
+                    max={20}
+                    step={0.5}
+                    disabled={!macScroll.optionAccelerate}
+                    onCommit={(optionFactor) =>
+                      updateMacScroll({ optionFactor })
+                    }
+                  />
+                  <SettingsToggleRow
+                    label={ui.settings.macScrollShiftHorizontal}
+                    copy={ui.settings.macScrollShiftHorizontalCopy}
+                    value={macScroll.shiftHorizontal}
+                    enabledLabel={ui.common.enabled}
+                    disabledLabel={ui.common.disabled}
+                    onChange={(shiftHorizontal) =>
+                      updateMacScroll({ shiftHorizontal })
+                    }
+                  />
+                  <SettingsToggleRow
+                    label={ui.settings.macScrollCommandBypass}
+                    copy={ui.settings.macScrollCommandBypassCopy}
+                    value={macScroll.commandBypass}
+                    enabledLabel={ui.common.enabled}
+                    disabledLabel={ui.common.disabled}
+                    onChange={(commandBypass) =>
+                      updateMacScroll({ commandBypass })
+                    }
+                  />
+                  <SettingsNumberRow
+                    label={ui.settings.macScrollStep}
+                    copy={ui.settings.macScrollStepCopy}
+                    value={macScroll.step}
+                    min={1}
+                    max={500}
+                    step={0.1}
+                    onCommit={(step) => updateMacScroll({ step })}
+                  />
+                  <SettingsNumberRow
+                    label={ui.settings.macScrollSpeed}
+                    copy={ui.settings.macScrollSpeedCopy}
+                    value={macScroll.speed}
+                    min={0.1}
+                    max={10}
+                    step={0.1}
+                    onCommit={(speed) => updateMacScroll({ speed })}
+                  />
+                  <SettingsNumberRow
+                    label={ui.settings.macScrollTransition}
+                    copy={ui.settings.macScrollTransitionCopy}
+                    value={macScroll.transition}
+                    min={0.01}
+                    max={1}
+                    step={0.005}
+                    disabled={!macScroll.smooth}
+                    onCommit={(transition) => updateMacScroll({ transition })}
+                  />
+                  <SettingsNumberRow
+                    label={ui.settings.macScrollIntervalMs}
+                    copy={ui.settings.macScrollIntervalCopy}
+                    value={macScroll.intervalMs}
+                    min={4}
+                    max={32}
+                    step={1}
+                    disabled={!macScroll.smooth}
+                    onCommit={(intervalMs) =>
+                      updateMacScroll({ intervalMs: Math.round(intervalMs) })
+                    }
+                  />
+                </section>
+              ) : null}
 
               <section className="surface-card modifier-card">
                 <div className="card-title-row">
@@ -3632,6 +3805,119 @@ function normalizePort(value: number) {
 function normalizeEdgeSwitchHotkeyInput(value: string) {
   const normalized = value.trim().toLowerCase().replace(/\s+/g, "");
   return normalized.length === 0 ? "alt+shift+k" : normalized;
+}
+
+/** An enabled/disabled row with the standard info tooltip. Extracted because
+ *  the macOS scroll block alone needs five of them. */
+function SettingsToggleRow({
+  label,
+  copy,
+  value,
+  enabledLabel,
+  disabledLabel,
+  onChange,
+}: {
+  label: string;
+  copy: string;
+  value: boolean;
+  enabledLabel: string;
+  disabledLabel: string;
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <div className="settings-control-row">
+      <span>
+        {label}
+        <span className="info-tooltip-host" tabIndex={0}>
+          ⓘ
+          <span className="info-tooltip">{copy}</span>
+        </span>
+      </span>
+      <div className="segmented-control">
+        <button
+          type="button"
+          className={value ? "active" : ""}
+          onClick={() => onChange(true)}
+        >
+          {enabledLabel}
+        </button>
+        <button
+          type="button"
+          className={!value ? "active" : ""}
+          onClick={() => onChange(false)}
+        >
+          {disabledLabel}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Numeric row that keeps the half-typed value local and only commits a
+ *  clamped number on blur/Enter, so typing "0.0" never lands as 0 mid-keystroke
+ *  and re-renders the field out from under the caret. */
+function SettingsNumberRow({
+  label,
+  copy,
+  value,
+  min,
+  max,
+  step,
+  disabled,
+  onCommit,
+}: {
+  label: string;
+  copy: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  disabled?: boolean;
+  onCommit: (next: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  const [synced, setSynced] = useState(value);
+  if (synced !== value) {
+    setSynced(value);
+    setDraft(String(value));
+  }
+  const commit = (raw: string) => {
+    const parsed = Number(raw);
+    const next = Number.isFinite(parsed)
+      ? Math.min(max, Math.max(min, parsed))
+      : value;
+    setDraft(String(next));
+    onCommit(next);
+  };
+  return (
+    <div className="settings-control-row">
+      <span>
+        {label}
+        <span className="info-tooltip-host" tabIndex={0}>
+          ⓘ
+          <span className="info-tooltip">{copy}</span>
+        </span>
+      </span>
+      <span className="settings-number-with-unit">
+        <input
+          className="settings-number-input"
+          type="number"
+          min={min}
+          max={max}
+          step={step}
+          value={draft}
+          disabled={disabled}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={(event) => commit(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              (event.target as HTMLInputElement).blur();
+            }
+          }}
+        />
+      </span>
+    </div>
+  );
 }
 
 function renderHotkeyTags(displayHotkey: string, platform = "") {

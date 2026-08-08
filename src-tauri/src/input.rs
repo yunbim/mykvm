@@ -749,17 +749,18 @@ fn input_receive_status(layout: &LayoutState, request_permission: bool) -> Nativ
         };
     }
 
-    // When Secure Keyboard Entry is active anywhere on the system, macOS silently
-    // drops *every* synthetic key event while still delivering synthetic mouse
-    // events. That is exactly the "clicks work but the keyboard does nothing"
-    // symptom, so we surface it instead of failing silently.
-    #[cfg(target_os = "macos")]
-    if macos_secure_input_enabled() {
-        return NativeStageStatus {
-            state: "error".into(),
-            detail: "检测到 macOS 安全键盘输入(Secure Keyboard Entry)已开启，系统会拦截所有注入的键盘事件（鼠标点击不受影响）。请退出正在占用安全输入的应用——常见来源：终端里勾选的“安全键盘输入”、聚焦中的密码输入框、部分密码管理器；必要时注销重新登录，然后重试。".into(),
-        };
-    }
+    // NOTE: Secure Keyboard Entry is deliberately NOT probed here.
+    //
+    // `IsSecureEventInputEnabled()` is a *system-wide* flag, not a
+    // "MyKVM is blocked" flag. `loginwindow` holds it for a while after boot
+    // and after every unlock, Terminal holds it whenever its menu item is
+    // checked, and password managers hold it whenever their field has focus.
+    // Reporting that as a hard `error` from a status function that the UI polls
+    // every two seconds produced a modal that reappeared as fast as the user
+    // could dismiss it — with nothing actually broken. Detection now happens
+    // on demand at the point a key is really injected
+    // (`macos_probe_secure_input_on_key_inject`), degrades silently, and at
+    // most raises one non-blocking notification per episode.
 
     NativeStageStatus {
         state: "ready".into(),
@@ -807,6 +808,88 @@ fn macos_secure_input_enabled() -> bool {
     }
 
     unsafe { IsSecureEventInputEnabled() != 0 }
+}
+
+/// Minimum spacing between two Secure Keyboard Entry probes. The Carbon call is
+/// cheap but it still crosses into HIToolbox, and a held key repeats at up to
+/// ~30 Hz, so it is rate limited rather than run per keystroke.
+#[cfg(target_os = "macos")]
+const SECURE_INPUT_PROBE_INTERVAL_MS: u64 = 2_000;
+
+/// On-demand Secure Keyboard Entry check, called from the key-injection path.
+///
+/// Runs only when a key is actually being injected — never on a timer and never
+/// during startup — so a transient system-wide secure-input holder (loginwindow
+/// right after boot, a focused password field, Terminal's "Secure Keyboard
+/// Entry" menu item) can no longer surface as a startup error.
+///
+/// Behaviour when it *is* on: log once, raise a single non-blocking
+/// notification per episode, and otherwise degrade silently. The CGEvent is
+/// still posted; macOS discards it, which is the documented behaviour and not
+/// something the app can work around. The latch resets as soon as a later probe
+/// sees secure input switched off, so a genuine recurrence notifies again.
+#[cfg(target_os = "macos")]
+fn macos_probe_secure_input_on_key_inject() {
+    // Monotonic ms since the first probe. 0 is reserved for "never probed".
+    static PROBE_EPOCH: OnceLock<Instant> = OnceLock::new();
+    static LAST_PROBE_MS: AtomicU64 = AtomicU64::new(0);
+    static NOTIFIED: AtomicBool = AtomicBool::new(false);
+
+    let stamp = PROBE_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .saturating_add(1) as u64;
+    let last = LAST_PROBE_MS.load(Ordering::Relaxed);
+    if last != 0 && stamp.saturating_sub(last) < SECURE_INPUT_PROBE_INTERVAL_MS {
+        return;
+    }
+    LAST_PROBE_MS.store(stamp, Ordering::Relaxed);
+
+    if !macos_secure_input_enabled() {
+        NOTIFIED.store(false, Ordering::Relaxed);
+        return;
+    }
+    if NOTIFIED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    log::info!(
+        "macOS Secure Keyboard Entry is enabled system-wide; injected key events are being \
+         discarded by the window server until the owning app releases it"
+    );
+    notify_secure_input_blocked();
+}
+
+/// One-shot, non-blocking heads-up that injected keys are being swallowed.
+/// Deliberately a notification banner, not a modal: nothing the user does in
+/// MyKVM can clear the condition, so it must never take over the window.
+#[cfg(target_os = "macos")]
+fn notify_secure_input_blocked() {
+    let Some(app) = NOTIFY_APP_HANDLE.get() else {
+        return;
+    };
+    let (title, body) = if notify_language_is_en() {
+        (
+            "mykvm · Keyboard blocked",
+            "macOS Secure Keyboard Entry is on, so remote keystrokes are discarded (clicks still \
+             work). Leave the password field, or uncheck Terminal > Secure Keyboard Entry.",
+        )
+    } else {
+        (
+            "mykvm · 键盘被系统拦截",
+            "macOS 安全键盘输入已开启，远端按键会被系统丢弃（鼠标点击不受影响）。离开密码输入框，或取消勾选“终端 > 安全键盘输入”即可恢复。",
+        )
+    };
+    if let Err(error) = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+    {
+        log::warn!("secure input notification failed: {error}");
+    }
 }
 
 fn start_input_capture(
@@ -979,9 +1062,14 @@ fn start_platform_capture(
 
         while !stop.load(Ordering::Relaxed) {
             let was_remote_active = context.remote_active.load(Ordering::Relaxed);
-            if app_nap_suppressed != was_remote_active {
-                set_macos_app_nap_suppressed(was_remote_active);
-                app_nap_suppressed = was_remote_active;
+            // Receiver-side activity (this Mac being driven by a remote peer) is
+            // folded into the single App Nap decision so a backgrounded
+            // injection task is never throttled. See `macos_receiver_activity`.
+            let receiver_live = macos_receiver_activity::is_live();
+            let app_nap_target = was_remote_active || receiver_live;
+            if app_nap_suppressed != app_nap_target {
+                set_macos_app_nap_suppressed(app_nap_target);
+                app_nap_suppressed = app_nap_target;
             }
             let _ = CFRunLoop::run_in_mode(
                 unsafe { kCFRunLoopDefaultMode },
@@ -1008,9 +1096,15 @@ fn start_platform_capture(
             // making the server pointer reappear and follow the mouse.
             // Re-pin it to the anchor and re-assert hide while active.
             let is_remote_active = context.remote_active.load(Ordering::Relaxed);
-            if app_nap_suppressed != is_remote_active {
-                set_macos_app_nap_suppressed(is_remote_active);
-                app_nap_suppressed = is_remote_active;
+            // Re-evaluate App Nap with receiver activity folded in (single owner
+            // of the activity token — never call set_macos_app_nap_suppressed
+            // from two owners or the token leaks). The re-pin below stays on the
+            // sender-only `is_remote_active` so receiver state can't yank the
+            // local cursor to a stale anchor.
+            let app_nap_target = is_remote_active || receiver_live;
+            if app_nap_suppressed != app_nap_target {
+                set_macos_app_nap_suppressed(app_nap_target);
+                app_nap_suppressed = app_nap_target;
             }
             if is_remote_active {
                 repin_macos_cursor_while_remote(&context);
@@ -2292,6 +2386,13 @@ fn input_event_to_command(
 }
 
 fn inject_input_command(command: InputCommand) {
+    // Mark this Mac as actively being driven by a remote peer. On macOS this
+    // folds into the capture loop's App Nap decision so the backgrounded
+    // injection task is scheduled normally instead of being throttled — the
+    // root cause of the "first Win->Mac move after a pause is delayed/stuttery"
+    // symptom. Receiver-only: local capture on macOS never calls this path.
+    #[cfg(target_os = "macos")]
+    macos_receiver_activity::mark_remote_input();
     match command {
         InputCommand::MouseMove { x, y, drag_button } => inject_mouse_move(x, y, drag_button),
         InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
@@ -3189,6 +3290,7 @@ fn smooth_mouse_delta(dx: f64, dy: f64) -> (f64, f64) {
 /// smoother, which converts it into a pixel budget and drains it over many
 /// frames; otherwise it is posted as a plain line scroll. Reverse scrolling is
 /// applied here so it works on both platforms and for both paths.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn inject_scroll(delta_x: i32, delta_y: i32) {
     let (delta_x, delta_y) = if REVERSE_SCROLL.load(Ordering::Relaxed) {
         (-delta_x, -delta_y)
@@ -3200,6 +3302,17 @@ pub(crate) fn inject_scroll(delta_x: i32, delta_y: i32) {
     } else {
         post_line_scroll(delta_x, delta_y);
     }
+}
+
+/// macOS routes *every* scroll — the local wheel and remote injection alike —
+/// through the local scroll engine, so a single settings block governs both and
+/// a wheel tick feels identical whether the Mac is driving itself or being
+/// driven from the other machine. This is also why the toggles live on the Mac
+/// rather than on whichever machine happens to host the server UI: the settings
+/// that matter are the ones on the machine the pixels move on.
+#[cfg(target_os = "macos")]
+pub(crate) fn inject_scroll(delta_x: i32, delta_y: i32) {
+    macos_scroll::inject_notches(delta_x, delta_y);
 }
 
 /// Unsmoothed post: one wire notch becomes one native notch/line so the remote
@@ -3219,6 +3332,7 @@ fn post_line_scroll(delta_x: i32, delta_y: i32) {
     if let Ok(event) =
         CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)
     {
+        macos_scroll::tag_own_event(&event);
         event.post(CGEventTapLocation::HID);
     }
 }
@@ -3292,12 +3406,13 @@ fn post_smoothed_units(delta_x: i32, delta_y: i32) {
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         return;
     };
-    // Mos posts pixel deltas with `isContinuous = 1` so macOS animates the
-    // scroll (and rubber-bands at document edges) instead of snapping a notch.
+    // Pixel deltas with `isContinuous = 1` so macOS animates the scroll (and
+    // rubber-bands at document edges) instead of snapping a notch.
     if let Ok(event) =
         CGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 2, delta_y, delta_x, 0)
     {
-        event.set_integer_value_field(EventField::ScrollWheelEventIsContinuous, 1);
+        event.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
+        macos_scroll::tag_own_event(&event);
         event.post(CGEventTapLocation::HID);
     }
 }
@@ -3331,27 +3446,62 @@ fn post_smoothed_units(_delta_x: i32, _delta_y: i32) {}
 /// 3. **No idle spin.** The worker parks on a condvar between sessions instead
 ///    of waking 125×/s forever.
 mod scroll_smoothing {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    /// Mos defaults (`Options` / `Constants.swift`). `durationTransition` 4.35
-    /// maps to a per-frame lerp factor of ~0.085.
-    const TRANS: f64 = 0.085;
-    const STEP: f64 = 33.6;
-    const SPEED: f64 = 2.70;
-    /// Pixels one wheel notch is worth. Mos clamps the raw macOS pixel delta
-    /// (~10px/notch) up to `step` before applying `speed`, so a detent ends up
-    /// scrolling `step * speed` ≈ 90.7px — reproduced here directly because our
-    /// wire unit is already a notch count.
-    pub(super) const PIXELS_PER_NOTCH: f64 = STEP * SPEED;
+    /// Reference defaults. `durationTransition` 4.35 maps to a per-frame lerp
+    /// factor of ~0.085.
+    pub(super) const DEFAULT_TRANS: f64 = 0.085;
+    pub(super) const DEFAULT_STEP: f64 = 33.6;
+    pub(super) const DEFAULT_SPEED: f64 = 2.70;
+    pub(super) const DEFAULT_INTERVAL_MS: u64 = 8;
+    /// Pixels one wheel notch is worth at the default tuning. A sub-`step` raw
+    /// pixel delta (~10px/notch on macOS) is clamped up to `step` before
+    /// `speed` is applied, so a detent scrolls `step * speed` ≈ 90.7px —
+    /// reproduced directly because our wire unit is already a notch count.
+    ///
+    /// The live values are the atomics below; this const stays the reference
+    /// point for the tests and for the Windows unit conversion, which is not
+    /// user-tunable (the tuning UI is macOS-only).
+    pub(super) const PIXELS_PER_NOTCH: f64 = DEFAULT_STEP * DEFAULT_SPEED;
+
+    // Live tunables. Read on the worker/hot path, so they are plain atomics
+    // rather than a lock; f64 travels as its bit pattern.
+    static STEP_BITS: AtomicU64 = AtomicU64::new(DEFAULT_STEP.to_bits());
+    static SPEED_BITS: AtomicU64 = AtomicU64::new(DEFAULT_SPEED.to_bits());
+    static TRANS_BITS: AtomicU64 = AtomicU64::new(DEFAULT_TRANS.to_bits());
+    static INTERVAL_MS: AtomicU64 = AtomicU64::new(DEFAULT_INTERVAL_MS);
+
+    /// Publishes the user-tunable smoothing parameters. Values are clamped to
+    /// the range the interpolator stays stable in: `trans` outside (0, 1] either
+    /// never converges or overshoots, and an interval below 4ms would post
+    /// faster than any display refreshes.
+    pub(super) fn set_tunables(step: f64, speed: f64, transition: f64, interval_ms: u64) {
+        STEP_BITS.store(step.clamp(1.0, 500.0).to_bits(), Ordering::Relaxed);
+        SPEED_BITS.store(speed.clamp(0.1, 10.0).to_bits(), Ordering::Relaxed);
+        TRANS_BITS.store(transition.clamp(0.01, 1.0).to_bits(), Ordering::Relaxed);
+        INTERVAL_MS.store(interval_ms.clamp(4, 32), Ordering::Relaxed);
+    }
+
+    /// Live pixels-per-notch (`step * speed`).
+    pub(super) fn pixels_per_notch() -> f64 {
+        f64::from_bits(STEP_BITS.load(Ordering::Relaxed))
+            * f64::from_bits(SPEED_BITS.load(Ordering::Relaxed))
+    }
+
+    fn trans() -> f64 {
+        f64::from_bits(TRANS_BITS.load(Ordering::Relaxed))
+    }
+
+    fn interval() -> Duration {
+        Duration::from_millis(INTERVAL_MS.load(Ordering::Relaxed))
+    }
     /// Mos `ScrollFilter.polish` blends 23% of the new frame into the window.
     const FILTER_ALPHA: f64 = 0.23;
     /// Residual (px) at which an idle session is flushed and the worker parked.
     const SETTLE_PX: f64 = 0.5;
-    /// ~120Hz, matching Mos' CVDisplayLink cadence.
-    const INTERVAL: Duration = Duration::from_millis(8);
     /// How long after the last wheel tick the session counts as "released".
     const MANUAL_END: Duration = Duration::from_millis(180);
 
@@ -3404,7 +3554,7 @@ mod scroll_smoothing {
         if notches == 0.0 {
             return 0.0;
         }
-        notches.signum() * notches.abs().max(1.0) * PIXELS_PER_NOTCH
+        notches.signum() * notches.abs().max(1.0) * pixels_per_notch()
     }
 
     /// Mos `ScrollFilter.polish`: a one-pole blend read one frame late, which
@@ -3426,6 +3576,21 @@ mod scroll_smoothing {
             notches_to_pixels(delta_y as f64),
             notches_to_pixels(delta_x as f64),
         );
+        submit(px);
+    }
+
+    /// Entry point for the local macOS wheel tap, which has already converted
+    /// the raw event into pixels and applied the modifier scaling. `px` is
+    /// `(vertical, horizontal)` to match the axis order used internally.
+    #[cfg(target_os = "macos")]
+    pub(super) fn enqueue_pixels(px_y: f64, px_x: f64) {
+        if px_y == 0.0 && px_x == 0.0 {
+            return;
+        }
+        submit((px_y, px_x));
+    }
+
+    fn submit(px: (f64, f64)) {
         {
             let mut s = lock();
             push(&mut s, px);
@@ -3463,8 +3628,9 @@ mod scroll_smoothing {
     /// One interpolation frame. Returns `(out_x, out_y, finished)` in pixels;
     /// `finished` marks the flush frame that ends the session.
     pub(super) fn advance(s: &mut State, idle: bool) -> (f64, f64, bool) {
-        let frame_y = (s.buffer.0 - s.current.0) * TRANS;
-        let frame_x = (s.buffer.1 - s.current.1) * TRANS;
+        let trans = trans();
+        let frame_y = (s.buffer.0 - s.current.0) * trans;
+        let frame_x = (s.buffer.1 - s.current.1) * trans;
         s.current.0 += frame_y;
         s.current.1 += frame_x;
         let mut out_y = polish(&mut s.window.0, frame_y);
@@ -3501,7 +3667,7 @@ mod scroll_smoothing {
                         .unwrap_or_else(|poison| poison.into_inner());
                 }
             }
-            thread::sleep(INTERVAL);
+            thread::sleep(interval());
             let (out_x, out_y, finished) = {
                 let mut s = lock();
                 if !s.active {
@@ -3609,6 +3775,454 @@ mod scroll_smoothing {
                 assert!(!finished, "settled while the wheel was still turning");
             }
             assert!(s.active);
+        }
+    }
+}
+
+// --- macOS local scroll engine (#2) ----------------------------------------
+//
+// A self-contained replacement for a third-party scroll enhancer. Running one
+// alongside MyKVM meant two independent smoothers fighting over the same wheel:
+// each notch got expanded twice, which is why scrolling felt runaway fast, and
+// the reverse toggle appeared dead because the other tool re-flipped the axis
+// downstream. Owning the whole path removes the conflict and, more importantly,
+// puts the settings on the machine they actually take effect on.
+//
+// Two properties the design has to hold:
+//
+//  * **Independent of the link.** The engine is started when the app starts and
+//    keeps working with the KVM runtime stopped — it is the Mac's own scrolling,
+//    not a remote-control feature.
+//  * **Idle-free.** The tap is only created once a feature needs it, the
+//    callback is a handful of atomic loads, and the interpolation worker parks
+//    on a condvar between gestures. Nothing polls.
+
+/// User-facing configuration of the macOS local scroll engine. Defined for all
+/// platforms so the settings plumbing in `lib.rs` stays platform-agnostic; only
+/// the macOS build acts on it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MacScrollSettings {
+    /// Master switch for interpolated scrolling.
+    pub smooth: bool,
+    /// Natural / reversed wheel direction.
+    pub reverse: bool,
+    /// Hold Option to scroll faster.
+    pub option_accelerate: bool,
+    /// Multiplier applied while Option is held.
+    pub option_factor: f64,
+    /// Hold Shift to turn a vertical wheel into a horizontal scroll.
+    pub shift_horizontal: bool,
+    /// Hold Command to pass the wheel through untouched — keeps pinch-free
+    /// zoom (Cmd+wheel) working in browsers and image editors, which would
+    /// otherwise lose the modifier when we re-emit the event.
+    pub command_bypass: bool,
+    /// Pixels one detent is worth before `speed`.
+    pub step: f64,
+    /// Multiplier on `step`.
+    pub speed: f64,
+    /// Per-frame interpolation factor: lower glides longer, higher snaps.
+    pub transition: f64,
+    /// Frame interval of the interpolation worker, in milliseconds.
+    pub interval_ms: u64,
+}
+
+impl Default for MacScrollSettings {
+    fn default() -> Self {
+        MacScrollSettings {
+            smooth: true,
+            reverse: false,
+            option_accelerate: true,
+            option_factor: 3.0,
+            shift_horizontal: true,
+            command_bypass: true,
+            step: scroll_smoothing::DEFAULT_STEP,
+            speed: scroll_smoothing::DEFAULT_SPEED,
+            transition: scroll_smoothing::DEFAULT_TRANS,
+            interval_ms: scroll_smoothing::DEFAULT_INTERVAL_MS,
+        }
+    }
+}
+
+/// Publishes the scroll settings. No-op off macOS: the whole feature is
+/// macOS-only, and the UI hides it there.
+#[cfg(not(target_os = "macos"))]
+pub fn set_macos_scroll_settings(_settings: MacScrollSettings) {}
+
+#[cfg(target_os = "macos")]
+pub fn set_macos_scroll_settings(settings: MacScrollSettings) {
+    macos_scroll::apply(settings);
+}
+
+/// Starts the local scroll engine. Called once at app start, independently of
+/// the KVM runtime.
+#[cfg(not(target_os = "macos"))]
+pub fn start_macos_scroll_engine() {}
+
+#[cfg(target_os = "macos")]
+pub fn start_macos_scroll_engine() {
+    macos_scroll::start_if_needed();
+}
+
+#[cfg(target_os = "macos")]
+mod macos_scroll {
+    use super::{scroll_smoothing, MacScrollSettings};
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+
+    /// Written into every event we emit so the tap recognises its own output
+    /// and passes it straight through. Without it the engine would re-smooth
+    /// its own frames — an unbounded feedback loop.
+    const SELF_TAG: i64 = 0x4D_4B_56_43; // "MKVC"
+    /// `CGEventType::ScrollWheel`.
+    const EVENT_TYPE_SCROLL_WHEEL: u32 = 22;
+    /// Raw pixels macOS reports for one detent of a standard wheel. Only used
+    /// to recover a notch count from mice that report no line delta.
+    const RAW_PIXELS_PER_NOTCH: f64 = 10.0;
+
+    const FLAG_SHIFT: u64 = 0x0002_0000;
+    const FLAG_ALTERNATE: u64 = 0x0008_0000;
+    const FLAG_COMMAND: u64 = 0x0010_0000;
+
+    static SMOOTH: AtomicBool = AtomicBool::new(true);
+    static REVERSE: AtomicBool = AtomicBool::new(false);
+    static OPTION_ACCELERATE: AtomicBool = AtomicBool::new(true);
+    static OPTION_FACTOR: AtomicU64 = AtomicU64::new((3.0_f64).to_bits());
+    static SHIFT_HORIZONTAL: AtomicBool = AtomicBool::new(true);
+    static COMMAND_BYPASS: AtomicBool = AtomicBool::new(true);
+
+    static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static TAP_STARTED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn apply(settings: MacScrollSettings) {
+        SMOOTH.store(settings.smooth, Ordering::Relaxed);
+        REVERSE.store(settings.reverse, Ordering::Relaxed);
+        OPTION_ACCELERATE.store(settings.option_accelerate, Ordering::Relaxed);
+        OPTION_FACTOR.store(
+            settings.option_factor.clamp(1.0, 20.0).to_bits(),
+            Ordering::Relaxed,
+        );
+        SHIFT_HORIZONTAL.store(settings.shift_horizontal, Ordering::Relaxed);
+        COMMAND_BYPASS.store(settings.command_bypass, Ordering::Relaxed);
+        scroll_smoothing::set_tunables(
+            settings.step,
+            settings.speed,
+            settings.transition,
+            settings.interval_ms,
+        );
+        if intercepts_local_wheel() {
+            ensure_tap();
+        }
+    }
+
+    /// Whether any enabled feature needs to see the physical wheel. When none
+    /// do we never create the tap at all, so a user who turns the engine off
+    /// pays nothing.
+    fn intercepts_local_wheel() -> bool {
+        SMOOTH.load(Ordering::Relaxed)
+            || REVERSE.load(Ordering::Relaxed)
+            || OPTION_ACCELERATE.load(Ordering::Relaxed)
+            || SHIFT_HORIZONTAL.load(Ordering::Relaxed)
+    }
+
+    /// Stamps an event as ours. Public to the parent module so both post paths
+    /// mark their output.
+    pub(super) fn tag_own_event(event: &core_graphics::event::CGEvent) {
+        use core_graphics::event::EventField;
+        event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, SELF_TAG);
+    }
+
+    /// Remote-injected scroll. Modifier handling is deliberately shared with the
+    /// local path so Shift/Option behave the same whether the wheel turned on
+    /// this Mac or on the machine driving it — the modifier keys are injected
+    /// here first, so the session flag state already reflects them.
+    pub(super) fn inject_notches(delta_x: i32, delta_y: i32) {
+        let flags = current_flags();
+        if COMMAND_BYPASS.load(Ordering::Relaxed) && flags & FLAG_COMMAND != 0 {
+            super::post_line_scroll(delta_x, delta_y);
+            return;
+        }
+        let (notch_x, notch_y) = transform(delta_x as f64, delta_y as f64, flags);
+        if SMOOTH.load(Ordering::Relaxed) {
+            scroll_smoothing::enqueue_pixels(
+                notches_to_pixels(notch_y),
+                notches_to_pixels(notch_x),
+            );
+        } else {
+            super::post_line_scroll(notch_x.round() as i32, notch_y.round() as i32);
+        }
+    }
+
+    /// Shared axis/direction/acceleration transform. Returns `(x, y)` notches.
+    fn transform(delta_x: f64, delta_y: f64, flags: u64) -> (f64, f64) {
+        let (mut x, mut y) = (delta_x, delta_y);
+        if SHIFT_HORIZONTAL.load(Ordering::Relaxed) && flags & FLAG_SHIFT != 0 && x == 0.0 {
+            // Only borrow the vertical axis when the device isn't already
+            // producing a horizontal delta, otherwise a tilt wheel would cancel
+            // itself out.
+            x = y;
+            y = 0.0;
+        }
+        if REVERSE.load(Ordering::Relaxed) {
+            x = -x;
+            y = -y;
+        }
+        if OPTION_ACCELERATE.load(Ordering::Relaxed) && flags & FLAG_ALTERNATE != 0 {
+            let factor = f64::from_bits(OPTION_FACTOR.load(Ordering::Relaxed));
+            x *= factor;
+            y *= factor;
+        }
+        (x, y)
+    }
+
+    /// Notches to pixels using the live tuning, preserving the "a fraction of a
+    /// detent still moves a full step" behaviour of the smoother.
+    fn notches_to_pixels(notches: f64) -> f64 {
+        if notches == 0.0 {
+            return 0.0;
+        }
+        notches.signum() * notches.abs().max(1.0) * scroll_smoothing::pixels_per_notch()
+    }
+
+    fn current_flags() -> u64 {
+        // Combined session state so modifiers injected by the remote count too.
+        unsafe { CGEventSourceFlagsState(0) }
+    }
+
+    // --- event tap ---------------------------------------------------------
+
+    /// Startup entry point. Skips the tap entirely when the user has every
+    /// feature off; `apply` installs it later if they turn one back on.
+    pub(super) fn start_if_needed() {
+        if intercepts_local_wheel() {
+            ensure_tap();
+        }
+    }
+
+    fn ensure_tap() {
+        if TAP_STARTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("mac-scroll-engine".into())
+            .spawn(run_tap_loop)
+            .map(|_| ())
+            .unwrap_or_else(|error| {
+                TAP_STARTED.store(false, Ordering::Relaxed);
+                log::warn!("local scroll engine thread failed to start: {error}");
+            });
+    }
+
+    fn run_tap_loop() {
+        use core_foundation::base::TCFType;
+        use core_foundation::mach_port::CFMachPort;
+        use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+        use core_graphics::event::{CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement};
+
+        // Session (not HID) location on purpose: HID taps run first, so the
+        // capture tap that forwards input to the other machine still gets the
+        // wheel untouched while the cursor is remote, and we only ever see the
+        // events it let through — i.e. exactly the ones scrolling this Mac.
+        let port = unsafe {
+            super::macos_raw_event_tap_create(
+                CGEventTapLocation::Session,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::Default,
+                1_u64 << EVENT_TYPE_SCROLL_WHEEL,
+                scroll_tap_callback,
+                std::ptr::null(),
+            )
+        };
+        if port.is_null() {
+            // Almost always missing Accessibility permission. Silent degrade:
+            // scrolling keeps working, just without the engine.
+            TAP_STARTED.store(false, Ordering::Relaxed);
+            log::warn!("local scroll engine tap could not be created (accessibility permission?)");
+            return;
+        }
+
+        let mach_port = unsafe { CFMachPort::wrap_under_create_rule(port) };
+        TAP_PORT.store(port.cast(), Ordering::Relaxed);
+        let Some(source) = mach_port.create_runloop_source(0).ok() else {
+            TAP_PORT.store(std::ptr::null_mut(), Ordering::Relaxed);
+            TAP_STARTED.store(false, Ordering::Relaxed);
+            log::warn!("local scroll engine run loop source could not be created");
+            return;
+        };
+        CFRunLoop::get_current().add_source(&source, unsafe { kCFRunLoopCommonModes });
+        unsafe { super::macos_raw_event_tap_enable(mach_port.as_concrete_TypeRef(), true) };
+        log::info!("local scroll engine started");
+        // Blocks forever on the run loop: no polling, no wakeups between
+        // scroll events.
+        CFRunLoop::run_current();
+    }
+
+    unsafe extern "C" fn scroll_tap_callback(
+        _proxy: core_graphics::event::CGEventTapProxy,
+        event_type: u32,
+        event: core_graphics::sys::CGEventRef,
+        _user_info: *const c_void,
+    ) -> core_graphics::sys::CGEventRef {
+        if matches!(
+            event_type,
+            super::MACOS_RAW_EVENT_TAP_DISABLED_BY_TIMEOUT
+                | super::MACOS_RAW_EVENT_TAP_DISABLED_BY_USER_INPUT
+        ) {
+            let port = TAP_PORT.load(Ordering::Relaxed);
+            if !port.is_null() {
+                unsafe { super::macos_raw_event_tap_enable(port.cast(), true) };
+            }
+            return event;
+        }
+        if event_type != EVENT_TYPE_SCROLL_WHEEL || !intercepts_local_wheel() {
+            return event;
+        }
+        unsafe { handle_local_wheel(event) }
+    }
+
+    /// Reads the incoming event through the C API rather than wrapping it in a
+    /// `CGEvent`: the callback only borrows the event, and the owned wrapper
+    /// would release a reference we never retained.
+    unsafe fn handle_local_wheel(
+        raw: core_graphics::sys::CGEventRef,
+    ) -> core_graphics::sys::CGEventRef {
+        use core_graphics::event::EventField;
+
+        // Our own output, looping back through the session stream.
+        if unsafe { CGEventGetIntegerValueField(raw, EventField::EVENT_SOURCE_USER_DATA) }
+            == SELF_TAG
+        {
+            return raw;
+        }
+        // Trackpads and Magic Mouse already produce continuous, momentum-scrolled
+        // pixel streams. Re-smoothing those would fight Apple's own physics, so
+        // they are left alone — the engine is for detented wheels.
+        if unsafe {
+            CGEventGetIntegerValueField(raw, EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS)
+        } != 0
+        {
+            return raw;
+        }
+
+        let flags = unsafe { CGEventGetFlags(raw) };
+        if COMMAND_BYPASS.load(Ordering::Relaxed) && flags & FLAG_COMMAND != 0 {
+            // Untouched: Cmd+wheel zoom keeps its modifier.
+            return raw;
+        }
+
+        let line_y =
+            unsafe { CGEventGetIntegerValueField(raw, EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1) };
+        let line_x =
+            unsafe { CGEventGetIntegerValueField(raw, EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2) };
+        let (notch_y, notch_x) = if line_y != 0 || line_x != 0 {
+            (line_y as f64, line_x as f64)
+        } else {
+            // Some wheels report only a point delta; recover a notch count so
+            // the tuning stays in the same unit.
+            unsafe {
+                (
+                    CGEventGetDoubleValueField(
+                        raw,
+                        EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
+                    ) / RAW_PIXELS_PER_NOTCH,
+                    CGEventGetDoubleValueField(
+                        raw,
+                        EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
+                    ) / RAW_PIXELS_PER_NOTCH,
+                )
+            }
+        };
+        if notch_y == 0.0 && notch_x == 0.0 {
+            return raw;
+        }
+
+        let (out_x, out_y) = transform(notch_x, notch_y, flags);
+        if SMOOTH.load(Ordering::Relaxed) {
+            scroll_smoothing::enqueue_pixels(notches_to_pixels(out_y), notches_to_pixels(out_x));
+        } else {
+            super::post_line_scroll(out_x.round() as i32, out_y.round() as i32);
+        }
+        // Swallow the original: the replacement has already been queued.
+        std::ptr::null_mut()
+    }
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceFlagsState(state_id: u32) -> u64;
+        fn CGEventGetIntegerValueField(
+            event: core_graphics::sys::CGEventRef,
+            field: core_graphics::event::CGEventField,
+        ) -> i64;
+        fn CGEventGetDoubleValueField(
+            event: core_graphics::sys::CGEventRef,
+            field: core_graphics::event::CGEventField,
+        ) -> f64;
+        fn CGEventGetFlags(event: core_graphics::sys::CGEventRef) -> u64;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::{Mutex, MutexGuard};
+
+        /// The settings are process-wide atomics, so the cases have to run one
+        /// at a time or they read each other's state.
+        static SERIAL: Mutex<()> = Mutex::new(());
+
+        fn reset() -> MutexGuard<'static, ()> {
+            let guard = SERIAL.lock().unwrap_or_else(|poison| poison.into_inner());
+            SMOOTH.store(true, Ordering::Relaxed);
+            REVERSE.store(false, Ordering::Relaxed);
+            OPTION_ACCELERATE.store(true, Ordering::Relaxed);
+            OPTION_FACTOR.store((3.0_f64).to_bits(), Ordering::Relaxed);
+            SHIFT_HORIZONTAL.store(true, Ordering::Relaxed);
+            COMMAND_BYPASS.store(true, Ordering::Relaxed);
+            guard
+        }
+
+        #[test]
+        fn shift_moves_the_wheel_onto_the_horizontal_axis() {
+            let _guard = reset();
+            assert_eq!(transform(0.0, 3.0, FLAG_SHIFT), (3.0, 0.0));
+            // A tilt wheel already scrolling sideways is left alone.
+            assert_eq!(transform(2.0, 3.0, FLAG_SHIFT), (2.0, 3.0));
+            // Disabled -> untouched.
+            SHIFT_HORIZONTAL.store(false, Ordering::Relaxed);
+            assert_eq!(transform(0.0, 3.0, FLAG_SHIFT), (0.0, 3.0));
+        }
+
+        #[test]
+        fn reverse_flips_both_axes() {
+            let _guard = reset();
+            REVERSE.store(true, Ordering::Relaxed);
+            assert_eq!(transform(1.0, -2.0, 0), (-1.0, 2.0));
+        }
+
+        #[test]
+        fn option_scales_by_the_configured_factor() {
+            let _guard = reset();
+            assert_eq!(transform(0.0, 2.0, FLAG_ALTERNATE), (0.0, 6.0));
+            OPTION_ACCELERATE.store(false, Ordering::Relaxed);
+            assert_eq!(transform(0.0, 2.0, FLAG_ALTERNATE), (0.0, 2.0));
+        }
+
+        #[test]
+        fn shift_and_option_compose_after_reversal() {
+            let _guard = reset();
+            REVERSE.store(true, Ordering::Relaxed);
+            // Vertical 1 -> horizontal 1 -> reversed -> tripled.
+            assert_eq!(transform(0.0, 1.0, FLAG_SHIFT | FLAG_ALTERNATE), (-3.0, 0.0));
+        }
+
+        #[test]
+        fn command_bypass_and_feature_gate_control_the_tap() {
+            let _guard = reset();
+            SMOOTH.store(false, Ordering::Relaxed);
+            REVERSE.store(false, Ordering::Relaxed);
+            OPTION_ACCELERATE.store(false, Ordering::Relaxed);
+            SHIFT_HORIZONTAL.store(false, Ordering::Relaxed);
+            assert!(!intercepts_local_wheel());
+            SMOOTH.store(true, Ordering::Relaxed);
+            assert!(intercepts_local_wheel());
         }
     }
 }
@@ -5767,6 +6381,70 @@ fn set_macos_app_nap_suppressed(suppress: bool) {
     }
 }
 
+/// Receiver-side "this Mac is currently being driven by a remote peer" activity.
+///
+/// This is deliberately separate from the sender-side `remote_active` carried by
+/// `MacCaptureContext` (which means "this Mac is *controlling* a remote" and
+/// owns an anchor used for cursor re-pin / decoupling). Conflating the two would
+/// make the capture loop re-pin the local cursor to a stale anchor and
+/// decouple the physical mouse while the Mac is only being controlled.
+///
+/// The fix for the cross-screen cursor symptom lives here: when the Mac is the
+/// *receiver* (e.g. Win -> Mac), nothing previously suppressed App Nap on the
+/// backgrounded injection task, so macOS throttled and coalesced its scheduling
+/// and the first cursor move after a pause came in late / stuttery. By marking
+/// activity here and folding it into the capture loop's single App Nap decision
+/// (it is the only other caller of `set_macos_app_nap_suppressed`, so the
+/// activity token can never leak), the injection task is scheduled normally for
+/// the whole time it is being driven.
+#[cfg(target_os = "macos")]
+mod macos_receiver_activity {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static LAST_NS: AtomicU64 = AtomicU64::new(0);
+
+    // After this much silence we consider the remote peer to have stopped driving
+    // this Mac and release App Nap again (the activity still allows idle sleep,
+    // but there is no reason to keep the process unsuppressed when idle).
+    const IDLE_NS: u64 = 250_000_000;
+
+    /// Call on every injected remote input event. Suppresses App Nap
+    /// immediately on the first event of a burst so the very first move is not
+    /// throttled; subsequent events only refresh the liveness timestamp.
+    pub fn mark_remote_input() {
+        let now = now_ns();
+        LAST_NS.store(now, Ordering::Relaxed);
+        if !ACTIVE.swap(true, Ordering::Relaxed) {
+            super::set_macos_app_nap_suppressed(true);
+        }
+    }
+
+    /// Called from the macOS capture loop on every poll. Returns whether the
+    /// receiver is still actively being driven and clears `ACTIVE` once it has
+    /// gone stale so the loop releases App Nap.
+    pub fn is_live() -> bool {
+        if !ACTIVE.load(Ordering::Relaxed) {
+            return false;
+        }
+        let now = now_ns();
+        if now.saturating_sub(LAST_NS.load(Ordering::Relaxed)) > IDLE_NS {
+            ACTIVE.store(false, Ordering::Relaxed);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn now_ns() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn set_macos_cursor_hidden_with_appkit(hidden: bool) {
     use std::ffi::c_void;
@@ -6599,11 +7277,31 @@ fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
     // Posted mouse-move events do not always update the visible macOS cursor.
     let _ = CGDisplay::warp_mouse_cursor_position(point);
 
-    if let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
+    // Cache the HID system event source per worker thread. Creating a fresh
+    // CGEventSource on every move round-trips through the HID system and was a
+    // measurable part of per-move latency during rapid cursor motion. It is
+    // immutable once built and only used on the thread that created it.
+    let source = HID_EVENT_SOURCE.with(|cached| {
+        if cached.borrow().is_none() {
+            *cached.borrow_mut() = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok();
+        }
+        cached.borrow().clone()
+    });
+    if let Some(source) = source {
         if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
             event.post(CGEventTapLocation::HID);
         }
     }
+}
+
+// Per-thread cache of the HID-system `CGEventSource` used to build injected
+// mouse events. `CGEventSource` is not `Sync`, so it lives in a `thread_local`
+// rather than a process-wide `static`; each tokio worker that handles an input
+// datagram builds one and reuses it for the life of the thread.
+#[cfg(target_os = "macos")]
+thread_local! {
+    static HID_EVENT_SOURCE: std::cell::RefCell<Option<core_graphics::event_source::CGEventSource>> =
+        std::cell::RefCell::new(None);
 }
 
 /// One pressed-button record for injected macOS click counting.
@@ -7134,6 +7832,10 @@ fn inject_key(key_code: u16, down: bool) {
         event_source::{CGEventSource, CGEventSourceStateID},
     };
 
+    // Rate-limited, on-demand only: this is the one place where Secure Keyboard
+    // Entry can actually hurt us, so it is also the only place we look.
+    macos_probe_secure_input_on_key_inject();
+
     // VK_CAPITAL: replicate the macOS "Caps Lock switches input sources"
     // behaviour for remote input. macOS honours that setting only for the
     // physical key — an injected caps keycode toggles neither the IME nor the
@@ -7506,6 +8208,7 @@ mod tests {
             smooth_scroll: true,
             reverse_scroll: false,
             pause_app_whitelist: Vec::new(),
+            macos_scroll: Default::default(),
         }
     }
 

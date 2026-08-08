@@ -94,12 +94,38 @@ export const TEXT = {
       mouseSmoothing: "鼠标平滑",
       mouseSmoothingCopy:
         "对每次移动的位移做低通滤波，过滤采集与网络的微小抖动，远程光标更顺滑。",
-      smoothScroll: "Mos 风格滚动",
+      smoothScroll: "平滑滚动",
       smoothScrollCopy:
-        "把滚轮输入交给 Mos 同款的连续插值器：按像素逐帧补间并做曲线平滑，接收端滚动更跟手、无卡顿。",
+        "把滚轮输入交给连续插值器：按像素逐帧补间并做曲线平滑，本机滚动更跟手、无卡顿。",
       reverseScroll: "反转滚动方向",
       reverseScrollCopy:
-        "开启后内容跟随手指移动（macOS 的“自然滚动”）。当两台机器的滚动方向设置不一致时用它对齐。",
+        "开启后内容跟随手指移动（“自然滚动”）。只影响本机被滚动时的方向，不会同步到另一台。",
+      macScrollTitle: "平滑滚动",
+      macScrollCopy:
+        "本机滚轮的完整接管方案，涵盖平滑、方向与修饰键加速，可完全替代第三方滚动增强工具（同时开启两套会互相叠加，导致滚动过快、反转失效，请只保留一套）。设置只作用于这台 Mac：无论你直接滚动它，还是从另一台机器遥控它，生效的都是这里的配置，因此不参与跨端同步。互联关闭时依然独立工作。",
+      macScrollSmooth: "平滑滚动",
+      macScrollSmoothCopy:
+        "把一次滚轮档位展开成一段逐帧插值的像素滚动，带曲线收尾。关闭后按原始档位直接滚动。",
+      macScrollReverse: "反转滚动方向",
+      macScrollReverseCopy: "内容跟随手指移动，即系统的“自然滚动”。",
+      macScrollOptionAccelerate: "Option 加速",
+      macScrollOptionAccelerateCopy: "按住 Option 时按下面的倍率放大滚动距离，用于长文档快速翻页。",
+      macScrollOptionFactor: "加速倍率",
+      macScrollShiftHorizontal: "Shift 转水平",
+      macScrollShiftHorizontalCopy:
+        "按住 Shift 时把纵向滚轮转成横向滚动。滚轮本身已有横向分量时不做转换。",
+      macScrollCommandBypass: "Command 临时禁用",
+      macScrollCommandBypassCopy:
+        "按住 Command 时原样放行滚轮事件，保留浏览器、图像软件里 Command+滚轮 的缩放。建议保持开启。",
+      macScrollStep: "每档像素",
+      macScrollStepCopy: "一个滚轮档位的基础距离。",
+      macScrollSpeed: "速度倍率",
+      macScrollSpeedCopy: "在每档像素之上再乘一个系数，实际距离 = 每档像素 × 速度倍率。",
+      macScrollTransition: "过渡系数",
+      macScrollTransitionCopy: "每帧向目标推进的比例。数值越小滑行越久越绵密，越大越干脆。",
+      macScrollIntervalMs: "帧间隔 (ms)",
+      macScrollIntervalCopy: "插值器出帧间隔，8ms 约合 120Hz。调大可降低占用，代价是略微变顿。",
+      macScrollReset: "恢复默认",
       appearanceTitle: "配置",
       language: "语言",
       simplifiedChinese: "cn 中文简体",
@@ -354,12 +380,41 @@ export const TEXT = {
       mouseSmoothing: "Mouse smoothing",
       mouseSmoothingCopy:
         "Low-pass filters each movement delta so capture/network jitter never reaches the remote cursor.",
-      smoothScroll: "Mos-style scroll",
+      smoothScroll: "Smooth scrolling",
       smoothScrollCopy:
-        "Runs wheel input through the same continuous interpolator Mos uses: pixel-precise, frame-by-frame tweening with curve smoothing, so the receiving side tracks your finger instead of stepping.",
+        "Runs wheel input through a continuous interpolator: pixel-precise, frame-by-frame tweening with curve smoothing, so this machine tracks your finger instead of stepping.",
       reverseScroll: "Reverse scroll direction",
       reverseScrollCopy:
-        "Content follows your finger, the way macOS \"natural scrolling\" does. Use it to line up two machines whose scroll directions disagree.",
+        "Content follows your finger (\"natural scrolling\"). Affects only how this machine scrolls; it is not synced to the other one.",
+      macScrollTitle: "Smooth scrolling",
+      macScrollCopy:
+        "A complete takeover of this Mac's wheel — smoothing, direction and modifier accelerators — meant to replace a third-party scroll enhancer outright. Running one alongside this stacks both engines, which is what makes scrolling run away and the reverse toggle look broken, so keep only one. These settings apply to this Mac whether you scroll it directly or drive it from the other machine, which is why they are never synced. They keep working with the link switched off.",
+      macScrollSmooth: "Smooth scrolling",
+      macScrollSmoothCopy:
+        "Expands one detent into a frame-by-frame pixel glide with an eased tail. Off scrolls by raw detents.",
+      macScrollReverse: "Reverse scroll direction",
+      macScrollReverseCopy: "Content follows your finger, i.e. the system's \"natural scrolling\".",
+      macScrollOptionAccelerate: "Option accelerates",
+      macScrollOptionAccelerateCopy:
+        "Hold Option to multiply the scroll distance by the factor below — handy for long documents.",
+      macScrollOptionFactor: "Acceleration factor",
+      macScrollShiftHorizontal: "Shift scrolls horizontally",
+      macScrollShiftHorizontalCopy:
+        "Hold Shift to turn a vertical wheel into horizontal scrolling. Skipped when the wheel already reports a horizontal component.",
+      macScrollCommandBypass: "Command bypasses",
+      macScrollCommandBypassCopy:
+        "Pass the wheel through untouched while Command is held, so Cmd+wheel zoom keeps working in browsers and image editors. Best left on.",
+      macScrollStep: "Pixels per detent",
+      macScrollStepCopy: "Base distance one wheel detent is worth.",
+      macScrollSpeed: "Speed multiplier",
+      macScrollSpeedCopy: "Applied on top of the step: distance = pixels per detent × speed.",
+      macScrollTransition: "Transition factor",
+      macScrollTransitionCopy:
+        "How much of the remaining distance each frame covers. Lower glides longer, higher snaps.",
+      macScrollIntervalMs: "Frame interval (ms)",
+      macScrollIntervalCopy:
+        "Interpolator output interval; 8ms is roughly 120Hz. Raising it lowers CPU at the cost of some fluidity.",
+      macScrollReset: "Reset to defaults",
       appearanceTitle: "Configuration",
       language: "Language",
       simplifiedChinese: "cn 中文简体",

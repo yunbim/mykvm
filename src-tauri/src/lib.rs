@@ -277,6 +277,62 @@ struct LayoutState {
     /// sharing to interrupt.
     #[serde(default = "default_pause_whitelist")]
     pause_app_whitelist: Vec<String>,
+    /// macOS local scroll engine. Deliberately **not** synced between devices:
+    /// scrolling is a receive-side concern, so the tuning belongs to the Mac
+    /// whose screen actually moves, whether it is being driven locally or from
+    /// the other machine. The UI only renders this block on macOS.
+    #[serde(default)]
+    macos_scroll: MacScrollConfig,
+}
+
+/// See `LayoutState::macos_scroll`. Mirrors `input::MacScrollSettings`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MacScrollConfig {
+    /// Master switch for interpolated ("smooth") scrolling.
+    #[serde(default = "default_mac_scroll_smooth")]
+    smooth: bool,
+    /// Natural / reversed direction.
+    #[serde(default)]
+    reverse: bool,
+    /// Hold Option to scroll faster.
+    #[serde(default = "default_mac_scroll_option_accelerate")]
+    option_accelerate: bool,
+    #[serde(default = "default_mac_scroll_option_factor")]
+    option_factor: f64,
+    /// Hold Shift to scroll horizontally.
+    #[serde(default = "default_mac_scroll_shift_horizontal")]
+    shift_horizontal: bool,
+    /// Hold Command to bypass the engine, so Cmd+wheel zoom keeps working.
+    #[serde(default = "default_mac_scroll_command_bypass")]
+    command_bypass: bool,
+    /// Pixels per detent before `speed`.
+    #[serde(default = "default_mac_scroll_step")]
+    step: f64,
+    #[serde(default = "default_mac_scroll_speed")]
+    speed: f64,
+    /// Per-frame interpolation factor: lower glides longer.
+    #[serde(default = "default_mac_scroll_transition")]
+    transition: f64,
+    #[serde(default = "default_mac_scroll_interval_ms")]
+    interval_ms: u64,
+}
+
+impl Default for MacScrollConfig {
+    fn default() -> Self {
+        Self {
+            smooth: default_mac_scroll_smooth(),
+            reverse: false,
+            option_accelerate: default_mac_scroll_option_accelerate(),
+            option_factor: default_mac_scroll_option_factor(),
+            shift_horizontal: default_mac_scroll_shift_horizontal(),
+            command_bypass: default_mac_scroll_command_bypass(),
+            step: default_mac_scroll_step(),
+            speed: default_mac_scroll_speed(),
+            transition: default_mac_scroll_transition(),
+            interval_ms: default_mac_scroll_interval_ms(),
+        }
+    }
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -1409,10 +1465,20 @@ fn merge_local_runtime_device_fields(incoming: &mut LayoutState, current: &Layou
 
 /// Mirrors the drag/fullscreen guard settings into the input layer's atomics.
 fn apply_scene_guard_settings(layout: &LayoutState) {
+    // `fullscreen_pause` gates edge crossings away from the machine you are
+    // actively driving. That decision is only ever made on the controller
+    // (server): a client being controlled never crosses edges, so applying the
+    // guard there is dead weight and would let one machine's foreground app
+    // shield a different machine. Server-only by design.
+    let fullscreen_pause = if layout.machine_role == "server" {
+        layout.fullscreen_pause
+    } else {
+        false
+    };
     input::set_scene_guard_settings(
         layout.drag_edge_guard,
         layout.drag_crossing_hold_ms,
-        layout.fullscreen_pause,
+        fullscreen_pause,
     );
 }
 
@@ -1422,7 +1488,27 @@ fn apply_input_smoothing_settings(layout: &LayoutState) {
         layout.smooth_scroll,
         layout.reverse_scroll,
     );
-    input::set_pause_whitelist(layout.pause_app_whitelist.clone());
+    input::set_macos_scroll_settings(input::MacScrollSettings {
+        smooth: layout.macos_scroll.smooth,
+        reverse: layout.macos_scroll.reverse,
+        option_accelerate: layout.macos_scroll.option_accelerate,
+        option_factor: layout.macos_scroll.option_factor,
+        shift_horizontal: layout.macos_scroll.shift_horizontal,
+        command_bypass: layout.macos_scroll.command_bypass,
+        step: layout.macos_scroll.step,
+        speed: layout.macos_scroll.speed,
+        transition: layout.macos_scroll.transition,
+        interval_ms: layout.macos_scroll.interval_ms,
+    });
+    // `pause_app_whitelist` is server-only for the same reason as
+    // `fullscreen_pause`: it shields the *controller's* foreground app, so a
+    // client must not evaluate or honour another machine's list.
+    let pause_whitelist = if layout.machine_role == "server" {
+        layout.pause_app_whitelist.clone()
+    } else {
+        Vec::new()
+    };
+    input::set_pause_whitelist(pause_whitelist);
     // Watcher threads raise native notifications off the UI thread, so they need
     // their own copy of the language setting (#6).
     input::set_notify_language(&layout.language);
@@ -3115,6 +3201,44 @@ fn macos_set_activation_policy(policy: i64) {
         let msg_policy: extern "C" fn(*mut c_void, *mut c_void, i64) =
             std::mem::transmute(objc_msgSend as *const ());
         msg_policy(ns_app, policy_sel, policy);
+
+        // Regular -> Accessory only takes visible effect once the app stops
+        // being the active application: AppKit keeps the Dock tile (and the
+        // app's menu bar) for as long as it is frontmost, which is exactly the
+        // "closed the window but the Dock icon is still there" symptom. Asking
+        // AppKit to deactivate hands focus back to the app underneath and the
+        // tile disappears on the same run-loop turn.
+        if policy != MACOS_ACTIVATION_POLICY_REGULAR {
+            let deactivate_sel = sel_registerName(b"deactivate\0".as_ptr() as *const c_char);
+            let msg_void: extern "C" fn(*mut c_void, *mut c_void) =
+                std::mem::transmute(objc_msgSend as *const ());
+            msg_void(ns_app, deactivate_sel);
+        }
+    }
+}
+
+/// `NSApplicationActivationPolicyRegular` — visible in the Dock and owns a menu bar.
+#[cfg(target_os = "macos")]
+const MACOS_ACTIVATION_POLICY_REGULAR: i64 = 0;
+/// `NSApplicationActivationPolicyAccessory` — menu-bar agent, no Dock tile.
+#[cfg(target_os = "macos")]
+const MACOS_ACTIVATION_POLICY_ACCESSORY: i64 = 1;
+
+/// Applies an activation policy from any thread.
+///
+/// `-[NSApplication setActivationPolicy:]` is AppKit and therefore main-thread
+/// only. It used to be called straight from `hide_main_window` /
+/// `destroy_main_window_handle`, which run on a Tauri command worker thread —
+/// off the main thread AppKit silently ignores the change, which is why the
+/// Dock icon survived closing the window. `run_on_main_thread` hops onto the
+/// AppKit thread; when we are already on it the closure runs inline, so the
+/// Dock tile disappears on the same turn rather than a frame later.
+#[cfg(target_os = "macos")]
+fn macos_apply_activation_policy(app: &AppHandle, policy: i64) {
+    if let Err(error) = app.run_on_main_thread(move || macos_set_activation_policy(policy)) {
+        log::warn!("failed to apply macOS activation policy {policy}: {error}");
+        // Last resort: a direct call still beats leaving the Dock inconsistent.
+        macos_set_activation_policy(policy);
     }
 }
 
@@ -3270,6 +3394,10 @@ pub fn run() {
                 // the very first events already honour the saved settings.
                 apply_scene_guard_settings(&layout);
                 apply_input_smoothing_settings(&layout);
+                // The macOS scroll engine is the Mac's own scrolling, not a
+                // remote-control feature: it comes up with the app and keeps
+                // working with the KVM runtime stopped. No-op elsewhere.
+                input::start_macos_scroll_engine();
                 // Hand the app handle to the input layer so platform-specific
                 // watchers (e.g. the Windows fullscreen pause detector) can
                 // raise native notifications without plumbing it through capture.
@@ -3467,7 +3595,8 @@ fn show_main_window_handle(app: &AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     macos_order_front_window(&window)?;
     #[cfg(target_os = "macos")]
-    macos_set_activation_policy(0); // Regular: show in the Dock while the window is open
+    // Regular: show in the Dock while the window is open.
+    macos_apply_activation_policy(app, MACOS_ACTIVATION_POLICY_REGULAR);
     set_main_window_visible(app, true);
     window
         .set_focus()
@@ -4241,6 +4370,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         smooth_scroll: default_smooth_scroll(),
         reverse_scroll: default_reverse_scroll(),
         pause_app_whitelist: default_pause_whitelist(),
+        macos_scroll: MacScrollConfig::default(),
         devices: vec![Device {
             id: device_id,
             name: local_device_name(),
@@ -4291,6 +4421,7 @@ fn detect_fallback_layout() -> LayoutState {
         smooth_scroll: default_smooth_scroll(),
         reverse_scroll: default_reverse_scroll(),
         pause_app_whitelist: default_pause_whitelist(),
+        macos_scroll: MacScrollConfig::default(),
     }
 }
 
@@ -4411,6 +4542,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         smooth_scroll: saved_layout.smooth_scroll,
         reverse_scroll: saved_layout.reverse_scroll,
         pause_app_whitelist: normalize_pause_whitelist(&saved_layout.pause_app_whitelist),
+        macos_scroll: saved_layout.macos_scroll.clone(),
     }
 }
 
@@ -4668,6 +4800,42 @@ fn default_reverse_scroll() -> bool {
 
 fn default_pause_whitelist() -> Vec<String> {
     Vec::new()
+}
+
+fn default_mac_scroll_smooth() -> bool {
+    true
+}
+
+fn default_mac_scroll_option_accelerate() -> bool {
+    true
+}
+
+fn default_mac_scroll_option_factor() -> f64 {
+    3.0
+}
+
+fn default_mac_scroll_shift_horizontal() -> bool {
+    true
+}
+
+fn default_mac_scroll_command_bypass() -> bool {
+    true
+}
+
+fn default_mac_scroll_step() -> f64 {
+    33.6
+}
+
+fn default_mac_scroll_speed() -> f64 {
+    2.7
+}
+
+fn default_mac_scroll_transition() -> f64 {
+    0.085
+}
+
+fn default_mac_scroll_interval_ms() -> u64 {
+    8
 }
 
 fn default_transport_port_mode() -> String {
@@ -7430,6 +7598,7 @@ mod tests {
             smooth_scroll: true,
             reverse_scroll: false,
             pause_app_whitelist: Vec::new(),
+            macos_scroll: MacScrollConfig::default(),
         }
     }
 

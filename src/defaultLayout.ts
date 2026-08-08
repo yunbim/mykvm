@@ -40,6 +40,18 @@ export const defaultLayout: LayoutState = {
   smoothScroll: true,
   reverseScroll: false,
   pauseAppWhitelist: [],
+  macosScroll: {
+    smooth: true,
+    reverse: false,
+    optionAccelerate: true,
+    optionFactor: 3,
+    shiftHorizontal: true,
+    commandBypass: true,
+    step: 33.6,
+    speed: 2.7,
+    transition: 0.085,
+    intervalMs: 8,
+  },
   devices: [
     {
       id: 'local-device',
