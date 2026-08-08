@@ -971,6 +971,10 @@ fn start_platform_capture(
         }
         tap.enable();
         let _ = ready_tx.send(Ok(()));
+        // Watch the frontmost app so sharing steps aside for a whitelisted one
+        // (#8). This mirrors the Windows capture thread; without it the macOS
+        // watcher never runs and the whitelist silently does nothing.
+        spawn_app_pause_watcher(Arc::clone(&stop));
         let mut app_nap_suppressed = false;
 
         while !stop.load(Ordering::Relaxed) {
@@ -4508,6 +4512,15 @@ fn handle_macos_event(
         return handle_macos_modifier_event(context, event_type, event);
     };
     drop(active);
+    // Paused scene while the remote still holds control: this happens when the
+    // user ⌘-Tabs into a whitelisted app without moving the mouse, so the
+    // mouse-move guard has not run yet. Release here as well, otherwise the
+    // local cursor stays hidden/decoupled and keystrokes keep going remote.
+    if scene_pause_active() {
+        log::info!("scene pause active — returning control to local");
+        return_to_local_macos(context);
+        return CallbackResult::Keep;
+    }
     let target = active_target.target.clone();
 
     let sent = match event_type {
@@ -4627,6 +4640,23 @@ fn handle_macos_mouse_move(
     use core_graphics::{event::CallbackResult, geometry::CGPoint};
 
     let location = event.location();
+    // A paused scene (whitelisted game, or any fullscreen window when no
+    // whitelist is configured) owns the screen. Hand control back to the local
+    // machine before touching anything else, mirroring the Windows hot path —
+    // the watcher thread only raises the flag, the release has to happen here
+    // because macOS keeps no global capture context to release from.
+    if scene_pause_active() {
+        let holds_remote = context
+            .active
+            .lock()
+            .map(|active| active.is_some())
+            .unwrap_or(false);
+        if holds_remote {
+            log::info!("scene pause active — returning control to local");
+            return_to_local_macos(context);
+        }
+        return CallbackResult::Keep;
+    }
     if let Ok(mut active) = context.active.lock() {
         if let Some(active_target) = active.as_mut() {
             let dy = if active_target.invert_y { -dy } else { dy };
@@ -5462,6 +5492,12 @@ fn drain_switch_request_macos(context: &MacCaptureContext) {
         Err(_) => return,
     };
     let Some(direction) = direction else { return };
+    // Paused scene in front: swallow the request rather than queueing it, so a
+    // stray hotkey during a game does not fire the moment the game exits.
+    if scene_pause_active() {
+        log::debug!("screen switch {direction:?} ignored: scene pause active");
+        return;
+    }
     let current_point = macos_current_cursor_location().map(|point| (point.x, point.y));
     match request_screen_switch_from_point(
         direction,

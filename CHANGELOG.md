@@ -25,6 +25,7 @@ release will reuse them).
 - macOS: a reboot no longer starts two copies of the app.
 - Pause/resume notifications now follow the app language instead of always being Chinese, and several untranslated strings in the UI ("Server"/"Client" badges, unknown platform label, a `bate`/`beta` typo) were fixed.
 - Keyboard, mouse, and clipboard could fail to connect between machines — the QUIC handshake rejected the peer with `invalid peer certificate: BadSignature`. The transport now pins the device's advertised certificate directly instead of running brittle chain validation over a self-signed certificate, which fixes cross-platform (macOS ↔ Windows) handshakes.
+- macOS: the **app-specific pause list** (pause input sharing when a chosen app is frontmost) now actually works. It was silently disabled on macOS because the frontmost-app watcher never started and the capture hot paths skipped the pause check, so the list did nothing. Sharing now correctly steps aside for a whitelisted app, and returns control to the local machine when you switch into or click inside it.
 
 ## v0.4.0
 

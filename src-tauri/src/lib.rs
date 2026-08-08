@@ -5009,9 +5009,10 @@ fn run_clipboard_sync(
     let mut sequence = now_ms();
 
     while !stop.load(Ordering::Relaxed) {
-        // A fullscreen app (game) is frontmost: stop polling the clipboard so
-        // nothing competes for CPU or touches the pasteboard mid-frame.
-        if input::fullscreen_app_active() {
+        // A paused-scene app (whitelisted game, or any fullscreen window when
+        // no whitelist is configured) is frontmost: stop polling the clipboard
+        // so nothing competes for CPU or touches the pasteboard mid-frame.
+        if input::scene_pause_active() {
             thread::sleep(Duration::from_millis(250));
             last_poll = Instant::now() - Duration::from_secs(1);
             continue;
