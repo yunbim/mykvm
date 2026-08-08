@@ -1,7 +1,0 @@
-# macOS (Apple Silicon) release link workaround.
-# 本机 rustc 1.97.1 与极新的 Apple ld (ld-27036.1 / clang 21) 不兼容，
-# release 下 proc-macro 的 .dylib 会生成损坏 (mis-aligned LINKEDIT string pool)，
-# 导致 serde_derive / zerofrom_derive 等 dlopen 失败。
-# 改用 rust 自带的 ld64.lld 链接即可稳定产出可用 dylib。
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-fuse-ld=/Users/thor_x/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld64.lld"]
