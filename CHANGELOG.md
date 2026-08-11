@@ -8,6 +8,10 @@ release will reuse them).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## v0.1.3
+
 ### Added
 
 - **macOS local smooth-scroll engine (replaces Mos).** A new macOS-only "平滑滚动" settings card lets you tune scrolling on the Mac itself — smooth scrolling, reverse direction, Option-to-accelerate, Shift-to-horizontal, Command-to-bypass, plus step/speed/transition/interval knobs. It runs independently of the KVM connection (low overhead while idle) and deliberately does **not** sync across machines, so it fully replaces third-party scroll enhancers without double-applying.
