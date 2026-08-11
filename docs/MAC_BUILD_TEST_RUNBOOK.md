@@ -1,6 +1,6 @@
 # macOS 编译 / 安装 / 验收手册
 
-> 适用于 fork `yunbim/mykvm`，v0.1.1 起。
+> 适用于 fork `yunbim/mykvm`，v0.1.3 起。
 > Windows 侧无法交叉编译 `aarch64-apple-darwin`，所有 macOS 专属代码路径（Dock 策略、
 > 焦点转移、单实例、Mos 滚动）**必须在真机上跑一遍本手册**才算验证通过。
 
@@ -43,7 +43,7 @@ cd ~/mykvm
 git fetch origin && git checkout main && git pull --ff-only
 ```
 
-确认拿到的是最新版（应输出 `0.1.1` 和对应 commit）：
+确认拿到的是最新版（应输出 `0.1.3` 和对应 commit）：
 
 ```bash
 git log --oneline -1
@@ -65,7 +65,7 @@ npm run mac:build-install
 
 ```
 src-tauri/target/aarch64-apple-darwin/release/bundle/macos/mykvm.app
-src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/mykvm_0.1.1_aarch64.dmg
+src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/mykvm_0.1.3_aarch64.dmg
 ```
 
 ### 权限（每次替换 .app 后都要确认）
