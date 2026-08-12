@@ -9,18 +9,18 @@
 | --- | --- |
 | 仓库（fork） | `https://github.com/yunbim/mykvm.git` |
 | 同步分支 | `main` |
-| **当前对齐 commit** | `bc186c1` |
+| **当前对齐 commit** | `a5147c6` |
 | **当前版本** | `v0.1.3`（tag `v0.1.3`） |
 | 上游（仅参考，勿推送） | `XxMinor/mykvm` |
 | 同步方式 | 两端都基于同一 `main`，改动先本机验证再 push；禁止直接推上游 |
-| 最近一次领先提交 | `bc186c1 feat: v0.1.3 — smooth-scroll, app-pause, cross-platform-handshake`（作者 Fei Yunbin / yunbim） |
+| 最近一次领先提交 | `a5147c6 docs: add dual-agent collaboration convention and Win->Mac wheel diagnosis`（作者 yunbim） |
 
 > 注意：Mac 端曾在 2026-08-11 有一笔本地 `input.rs` 编译修复提交，但 `v0.1.2` 已包含该修正（`EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS`）并大幅重写 `input.rs`，故 Mac 端已 `reset --hard origin/main` 追平，不再保留那笔冗余提交。
 
-### 两端构建/自测状态（截至 2026-08-11）
+### 两端构建/自测状态（截至 2026-08-12）
 - **Windows（yunbim）**：已自测通过 —— `cargo check ✅` · `cargo test 105/105 ✅` · `tsc ✅` · `eslint ✅`；产出安装包 `mykvm_0.1.3_x64-setup.exe (4.1 MB)`。
   - ⚠️ Windows 的 `cargo test` **不会编译 macOS-only 的 `input.rs` 代码块**，因此 macOS 专属代码仍需 Mac 端独立编译验证。
-- **Mac（本机 WorkBuddy 沙箱）**：对齐到 `bc186c1`，正基于 `scripts/build-mac-arm.sh` 做编译/测试验证（含 macOS-only 代码）。
+- **Mac（本机 WorkBuddy 沙箱）**：对齐到 `a5147c6`，已完成 `cargo test --lib`（117/117，含 macOS-only 代码）+ `cargo build --release`（rust-lld 链接，无 dylib 损坏）；已出 v0.1.3 自签名 `.app`/`.dmg` 并发布 GitHub Release v0.1.3（含 `latest.json` + `.sig`，更新私钥签名一致，app 端可校验通过）。
 
 ## 2. Mac 端（Apple Silicon，本机 WorkBuddy 沙箱）
 
@@ -43,13 +43,13 @@ env -u CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR -u CODEBUDDY_TOOL_CALL_ID -u NODE_OP
 - `ba31e3a`/`6d3d5fe` rust-lld 修复 dylib 损坏；`ce244c2` 可复现打包；`2b1d4d6` 自签名 + updater 指向 yunbim；`bc186c1` 平滑滚动引擎、应用暂停白名单、反向滚动、跨端 QUIC 握手修复（BadSignature）。
 
 ### 2.3 验证
-- `cargo test --lib -p mykvm`（v0.1.3 Windows 侧 105/105；Mac 侧待验证，需覆盖 macOS-only 代码）。
+- `cargo test --lib -p mykvm`（v0.1.3 Windows 侧 105/105；**Mac 侧 117/117 ✅ 含 macOS-only 代码**）。
 - `lsappinfo` 显示 `type="UIElement"`（无 Dock 图标）。
 - 单实例 UDS 锁位于 `$TMPDIR/mykvm.sock`（**非** `/tmp/mykvm.sock`）。
 - 手动步骤（agent 无法做）：系统设置授予 **Accessibility** + **Input Monitoring**。
 
-### 2.4 过期提醒
-> 本机 `~/.workbuddy/skills/mykvm-macos-build` 技能脚本是按 0.1.0/0.1.1 校准的：它靠 warm-cache 绕开 dylib 损坏、并做冗余的 `input.rs` patch。**v0.1.2 起该脚本已过时**，勿再用它构建；应改为调用仓库 `scripts/build-mac-arm.sh` + env 绕开。
+### 2.4 构建技能
+> `~/.workbuddy/skills/mykvm-macos-build` 已于 2026-08-12 重写：改为调用仓库 `scripts/build-mac-arm.sh` + `env -u CODEBUDDY_*` 绕开沙箱 shim，校准到 v0.1.3，去掉过时的暖缓存 / `--target aarch64-apple-darwin` / `input.rs` patch 逻辑。Mac 构建以仓库脚本为准。
 
 ## 3. Windows 端（由 Windows 设备维护 / 已自测 v0.1.3）
 
@@ -74,22 +74,22 @@ env -u CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR -u CODEBUDDY_TOOL_CALL_ID -u NODE_OP
 - [ ] **共享输入通道**：`shared_input.rs` 语义一致
 - [ ] **性能**：`performance.rs` 指标口径一致
 - [ ] **权限/可达性**：Mac Accessibility+InputMonitoring vs Windows 管理员（按需）
-- [ ] **应用暂停白名单**（v0.1.3 新增）：Mac 用 bundle id、Windows 用 exe 名；列表非空时完全取代旧「全屏自动暂停」规则
-- [ ] **反向滚动**（v0.1.3 新增，per-machine 开关）
-- [ ] **macOS 平滑滚动引擎**（v0.1.3 新增）：**macOS-only、client-only、刻意不跨机同步**（取代 Mos 等第三方增强）；Windows 无对应项（设计如此）
-- [ ] **端点归属 / 设置同步策略**：server-only 设置（应用暂停白名单、全屏自动暂停）在 client 端隐藏且不生效；macOS 滚动引擎仅 client。详见 `docs/ENDPOINT_OWNERSHIP.md`
+- [x] **应用暂停白名单**（v0.1.3 新增）：Mac 用 bundle id、Windows 用 exe 名；列表非空时完全取代旧「全屏自动暂停」规则
+- [x] **反向滚动**（v0.1.3 新增，per-machine 开关）
+- [x] **macOS 平滑滚动引擎**（v0.1.3 新增）：**macOS-only、client-only、刻意不跨机同步**（取代 Mos 等第三方增强）；Windows 无对应项（设计如此）
+- [x] **端点归属 / 设置同步策略**：server-only 设置（应用暂停白名单、全屏自动暂停）在 client 端隐藏且不生效；macOS 滚动引擎仅 client。详见 `docs/ENDPOINT_OWNERSHIP.md`
 - [ ] **自动启动**：`tauri-plugin-autostart`
 - [ ] **全局快捷键**：`tauri-plugin-global-shortcut`
 - [ ] **通知**：`tauri-plugin-notification`
-- [ ] **更新**：`tauri-plugin-updater`，产物按平台生成，更新私钥签名 `.sig`
+- [x] **更新**：`tauri-plugin-updater`，产物按平台生成，更新私钥签名 `.sig`（Mac 端 v0.1.3 Release 已含 `latest.json` + 签名一致的 `.app.tar.gz.sig`）
 - [ ] **Server/Client 角色、局域网发现（UDP 47833）、多显示器布局、主题、i18n（zh/en）、托盘** 两端一致
 
 ## 5. 「拉齐」验证（两端都达标才算对齐）
 
-- [x] 两端 `git rev-parse HEAD` 相同（当前 `bc186c1`）
+- [x] 两端 `git rev-parse HEAD` 相同（当前 `a5147c6`）
 - [x] 两端 `package.json` / `Cargo.toml` 版本均为 `v0.1.3`
 - [x] Windows 端 `cargo build` + `cargo test 105/105` 通过（不含 macOS-only 代码）
-- [ ] **Mac 端 `cargo build --release` + `cargo test --lib` 通过（含 macOS-only 代码）** ← 本机进行中
+- [x] **Mac 端 `cargo build --release` + `cargo test --lib` 通过（117/117，含 macOS-only 代码）**
 - [ ] 两端均能实际注入一次键鼠事件并回读验证
 - [ ] 跨端 Mac↔Win 一次 Server↔Client 连接/控制联通成功（验证 v0.1.3 握手修复）
 
@@ -104,9 +104,9 @@ env -u CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR -u CODEBUDDY_TOOL_CALL_ID -u NODE_OP
 
 ## 7. R&D 后续待办（跨端补齐方向）
 
-- [ ] **Mac 端基于 v0.1.3 完成编译 + `cargo test --lib` 验证（含 macOS-only 代码）** ← 进行中
+- [x] **Mac 端基于 v0.1.3 完成编译 + `cargo test --lib` 验证（117/117，含 macOS-only 代码）**
 - [ ] 实测 Mac↔Win 跨端握手与控制（验证 v0.1.3 BadSignature 修复）
 - [ ] Windows 端补全 §3 中单实例机制 / 打包签名策略 / 已知平台补丁
-- [ ] 评估 `mykvm-macos-build` 技能脚本是否下架/改写为调用 `scripts/build-mac-arm.sh`
+- [x] **`mykvm-macos-build` 技能脚本已重写为调用 `scripts/build-mac-arm.sh`（2026-08-12）**
 - [ ] 补齐 §4 中未勾选项的真实差异记录
 - [ ] 待两端确认缺口后，填入具体新功能需求

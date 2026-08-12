@@ -55,8 +55,8 @@
 - 已出包并安装 **`mykvm_0.1.3_x64-setup.exe`**（`C:\Users\shadow_\AppData\Local\mykvm\mykvm.exe`），与 Mac v0.1.3 对齐。
 - Windows 侧发送 notches 的协议未变，无需改动。
 
-## 5. 待 Mac agent 回填
+## 5. Mac agent 回填（2026-08-12）
 
-- [ ] Mac 授权是否到位、重启后 Win→Mac 滚轮是否恢复。
-- [ ] Mac 是否从最新 `main` 重建。
-- [ ] 若授权+最新构建后仍失败，抓 `log`/控制台输出回报，定位是否为 PIXEL continuous 滚动在某些 App 不被接受（届时可考虑远端注入改走 LINE 非连续路径）。
+- [x] **Mac 已从最新 `main`（v0.1.3 / `a5147c6`）重建**：`cargo test --lib` 117/117 通过（含 macOS-only 代码），`cargo build --release` 通过（rust-lld 链接，无 dylib 损坏）；已出 v0.1.3 自签名 `.app`/`.dmg` 并发布 GitHub Release v0.1.3（含 `latest.json` + `.sig`，更新私钥签名一致，app 端可校验通过）。「旧二进制」根因已排除。
+- [ ] **授权（人工步骤，agent 无法代做）**：需在系统设置 → 隐私与安全性 →「辅助功能」「输入监控」勾选 MyKVM，并**完全退出重启 app**。完成后 Win→Mac 滚轮/点击/键盘应恢复（否则 `CGEvent::post` 静默失败）。请在真机验证后回报。
+- [ ] **实机验证 Win→Mac 滚轮**：Mac 作为被控端，从 Windows 滚动 → 确认 Mac 滚动。若授权+最新构建后仍失败，抓 `log`/控制台输出回报（重点看 `local scroll engine tap could not be created (accessibility permission?)`），再决定是否远端注入改走 LINE 非连续路径。
