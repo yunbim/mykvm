@@ -55,8 +55,12 @@
 - 已出包并安装 **`mykvm_0.1.3_x64-setup.exe`**（`C:\Users\shadow_\AppData\Local\mykvm\mykvm.exe`），与 Mac v0.1.3 对齐。
 - Windows 侧发送 notches 的协议未变，无需改动。
 
-## 5. Mac agent 回填（2026-08-12）
+## 5. Mac agent 回填（2026-08-14，v0.1.4）
 
-- [x] **Mac 已从最新 `main`（v0.1.3 / `a5147c6`）重建**：`cargo test --lib` 117/117 通过（含 macOS-only 代码），`cargo build --release` 通过（rust-lld 链接，无 dylib 损坏）；已出 v0.1.3 自签名 `.app`/`.dmg` 并发布 GitHub Release v0.1.3（含 `latest.json` + `.sig`，更新私钥签名一致，app 端可校验通过）。「旧二进制」根因已排除。
-- [ ] **授权（人工步骤，agent 无法代做）**：需在系统设置 → 隐私与安全性 →「辅助功能」「输入监控」勾选 MyKVM，并**完全退出重启 app**。完成后 Win→Mac 滚轮/点击/键盘应恢复（否则 `CGEvent::post` 静默失败）。请在真机验证后回报。
-- [ ] **实机验证 Win→Mac 滚轮**：Mac 作为被控端，从 Windows 滚动 → 确认 Mac 滚动。若授权+最新构建后仍失败，抓 `log`/控制台输出回报（重点看 `local scroll engine tap could not be created (accessibility permission?)`），再决定是否远端注入改走 LINE 非连续路径。
+> **修正先前结论**：原 §2 把失效归结为「纯授权/旧二进制」。授权与最新构建仍是必要条件，但**代码侧确实存在一个回归**——见下方根因。§3 的「代码逐行正确」只对「两端协议/派发」成立，对「Mac 注入是否过引擎」判断有误。
+
+- [x] **真正根因（代码回归）**：`macOS` 接收端 `inject_scroll`（`input.rs:3314`）在 058835c 引入 mos 引擎后被改写成走 `macos_scroll::inject_notches` → `scroll_smoothing::enqueue_pixels` → **smoother worker 队列**。该队列与本地物理滚轮共用同一条「被引擎 tap 再加工」的路径；远端注入本应直接落到 app，却绕进了引擎的再平滑/再判定逻辑，导致 Win→Mac 滚轮在运行时被引擎 tap 吞掉或错位。这是「类 mos 功能上线后滚轮失效」的直接来源。
+- [x] **修复（v0.1.4）**：`inject_notches` 的 smooth 分支不再入队 worker，而是把已 cooked 的像素直接 `post_smoothed_units`（continuous + `SELF_TAG`）打到 HID——即引擎给自己输出用的同一种事件，于是引擎 tap（`scroll_tap_callback` 对 continuous / `SELF_TAG` 直接 `return raw`）**不再触碰它**。远端注入彻底绕开引擎。非 smooth / Cmd 分支维持 `post_line_scroll`（同样带 `SELF_TAG`）。这正是原 §5 末尾建议的「远端注入改走非引擎路径」落地版。
+- [x] **验证**：`cargo test --lib` 117/117 通过；`cargo check --lib` 通过。已出 v0.1.4 自签名 `.app`/`.dmg` 并发布 GitHub Release v0.1.4（含 `latest.json` + `.sig`）。
+- [ ] **授权（人工步骤，agent 无法代做）**：无论如何，**任何 `CGEvent::post`（滚轮/点击/键盘）都仍需**系统设置 → 隐私与安全性 →「辅助功能」「输入监控」勾选 MyKVM，并**完全退出重启 app**（仅重开窗口不够）。缺失时 `CGEvent::post` 静默失败、表现就是「滚轮压根没作用」。若 v0.1.4 + 授权 + 重启后仍失败，抓控制台日志（重点 `local scroll engine tap could not be created (accessibility permission?)`）回报。
+- [ ] **实机回归**：Mac 作被控端，从 Windows 滚动 → 确认 Mac 滚动；同时测 Mac 本地滚轮（确认引擎 tap 仍正常）。请在真机验证后回报。

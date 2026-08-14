@@ -3871,8 +3871,11 @@ mod macos_scroll {
 
     /// Written into every event we emit so the tap recognises its own output
     /// and passes it straight through. Without it the engine would re-smooth
-    /// its own frames — an unbounded feedback loop.
-    const SELF_TAG: i64 = 0x4D_4B_56_43; // "MKVC"
+    /// its own frames — an unbounded feedback loop. Also used by the HID
+    /// capture tap (see `handle_macos_event`) to skip events MyKVM injects on
+    /// behalf of the remote peer, so Win->Mac wheel/keys reach the local apps
+    /// instead of being forwarded back or dropped.
+    pub(super) const SELF_TAG: i64 = 0x4D_4B_56_43; // "MKVC"
     /// `CGEventType::ScrollWheel`.
     const EVENT_TYPE_SCROLL_WHEEL: u32 = 22;
     /// Raw pixels macOS reports for one detent of a standard wheel. Only used
@@ -3943,9 +3946,18 @@ mod macos_scroll {
         }
         let (notch_x, notch_y) = transform(delta_x as f64, delta_y as f64, flags);
         if SMOOTH.load(Ordering::Relaxed) {
-            scroll_smoothing::enqueue_pixels(
-                notches_to_pixels(notch_y),
-                notches_to_pixels(notch_x),
+            // Win->Mac receive path: post the cooked pixels straight to HID
+            // instead of enqueuing into the local smoother's worker thread.
+            // The Mos-style smoother is for the *physical* wheel on this Mac;
+            // remote input is already cooked and must reach the apps
+            // immediately. Posting a continuous, tagged pixel event is exactly
+            // the shape the engine emits for its own frames, so the engine tap
+            // ignores it (no re-smooth, no swallow). Routing received scroll
+            // through the smoother queue was the regression that broke Win->Mac
+            // wheel after the mos-like feature landed.
+            super::post_smoothed_units(
+                notches_to_pixels(notch_x) as i32,
+                notches_to_pixels(notch_y) as i32,
             );
         } else {
             super::post_line_scroll(notch_x.round() as i32, notch_y.round() as i32);
@@ -5089,6 +5101,19 @@ fn handle_macos_event(
             "[diag] event tap disabled by {:?} — mouse/key events are now DROPPED until re-enabled",
             event_type
         );
+        return CallbackResult::Keep;
+    }
+
+    // Skip events MyKVM itself injects on behalf of the remote peer. They are
+    // posted back through this same HID capture tap and must reach the local
+    // apps — not be forwarded to the peer or dropped. Without this guard the
+    // Mac-side capture tap (which forwards local input to the other machine)
+    // catches the injected Win->Mac wheel/keys and bounces them or swallows
+    // them, so the controlled Mac never scrolls/types. Mouse/key/scroll
+    // injectors all stamp `macos_scroll::SELF_TAG` via `tag_own_event`.
+    if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+        == macos_scroll::SELF_TAG
+    {
         return CallbackResult::Keep;
     }
 
@@ -7289,6 +7314,9 @@ fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
     });
     if let Some(source) = source {
         if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
+            // Mark as our own so the HID capture tap (which forwards local input
+            // to the peer) never bounces this injected move back / drops it.
+            macos_scroll::tag_own_event(&event);
             event.post(CGEventTapLocation::HID);
         }
     }
@@ -7503,6 +7531,8 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
             EventField::MOUSE_EVENT_CLICK_STATE,
             macos_click_state(button, down, x, y),
         );
+        // Mark as our own so the HID capture tap skips this injected click.
+        macos_scroll::tag_own_event(&event);
         event.post(CGEventTapLocation::HID);
     }
 }
@@ -7891,6 +7921,8 @@ fn inject_key(key_code: u16, down: bool) {
             // nothing on the Mac" bug.
             flags |= mac_function_section_flags(mac_code);
             event.set_flags(flags);
+            // Mark as our own so the HID capture tap skips this injected key.
+            macos_scroll::tag_own_event(&event);
             event.post(CGEventTapLocation::HID);
         }
         Err(_) => log::warn!("inject_key: failed to build keyboard event for mac code {mac_code}"),

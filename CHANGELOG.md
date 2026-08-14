@@ -10,6 +10,12 @@ release will reuse them).
 
 _Nothing yet._
 
+## v0.1.4
+
+### Fixed
+
+- **Win → Mac 滚轮失效（回归修复）。** macOS 接收端原本把远端注入的滚轮送进「类 mos 平滑滚动」引擎的 smoother worker 队列，与本地物理滚轮共用同一条被引擎 tap 再加工的路径，导致运行时滚轮事件被引擎 tap 吞掉 / 错位。现改为把已 cooked 的像素直接以 continuous + `SELF_TAG` 事件打到 HID，彻底绕开引擎（这正是引擎给自己输出用的事件形态，引擎 tap 会直接放行）。仍需在系统设置授予 MyKVM「辅助功能」「输入监控」并完全重启 app 后才生效。
+
 ## v0.1.3
 
 ### Added

@@ -27,7 +27,12 @@
 - [ ] **跨端 QUIC 握手（BadSignature 修复）真机验证**：v0.1.3 已把传输改为 pin 对端广播证书（绕过自签证书链校验）。Mac 侧代码就绪，需在真实 Mac↔Win 上各跑一次 Server↔Client 联通确认（Mac agent 沙箱无法做真机，已发布 v0.1.3 供人工验证）。
 - [ ] **共享协议改动需两端同步**：若任一侧动 `shared_input.rs` 的 `InputEvent` 等结构，务必在提交标注「待对方核对」，并同步 `ALIGNMENT.md` §4。
 
-## 5. 本端已交付（截至 2026-08-12）
-- v0.1.3 Mac 自签名包 + GitHub Release（含 latest.json + 签名一致更新产物）；`cargo test --lib` 117/117、`cargo build --release` 通过。
-- 过时技能 `~/.workbuddy/skills/mykvm-macos-build` 已重写为调用 `scripts/build-mac-arm.sh` + env 绕开（校准 v0.1.3）。
-- 回填了 `ALIGNMENT.md`（对齐 commit `a5147c6`、Mac 构建/测试状态、§4/§5/§7 勾选）与 `WIN_TO_MAC_WHEEL_DIAGNOSIS.md` §5。
+## 5. 本端已交付（截至 2026-08-14）
+- **v0.1.4 Mac 自签名包 + GitHub Release（含 latest.json + 签名一致更新产物）**；`cargo test --lib` 117/117、`cargo check --lib` 通过。
+- **修 Win→Mac 滚轮失效（回归）**：`inject_scroll`(macOS 接收端) 不再把远端滚轮送进 smoother worker 队列，改为直接 `post_smoothed_units`（continuous + `SELF_TAG`）打到 HID，彻底绕开本地 mos 引擎 tap。详见 `WIN_TO_MAC_WHEEL_DIAGNOSIS.md` §5（原「纯授权」结论已修正为「代码回归 + 授权必要」）。
+- 过时技能 `~/.workbuddy/skills/mykvm-macos-build` 已重写为调用 `scripts/build-mac-arm.sh` + env 绕开（校准 v0.1.4）。
+- 回填了 `WIN_TO_MAC_WHEEL_DIAGNOSIS.md` §5（含真实根因与 v0.1.4 修复）。
+
+## 6. 待 Windows 端接手/验证（2026-08-14）
+- [ ] **Win→Mac 滚轮真机回归**：装 v0.1.4 自签包、授予「辅助功能」「输入监控」并完全重启后，从 Windows 滚动确认 Mac 滚动；同时确认 Mac 本地滚轮仍正常（引擎 tap 未被误伤）。
+- [ ] **Mac→Win 反向链路实测**：仍待 Windows 端验证 Mac 作控制端 → Windows 被控端的滚轮/点击/键盘对称正确。
