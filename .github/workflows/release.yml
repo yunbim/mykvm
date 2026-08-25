@@ -382,6 +382,7 @@ jobs:
               exit 1
             fi
             echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
           else
             # Tauri updater signatures remain mandatory and are independent of
             # Apple code signing. This fallback lets a project without a paid
@@ -503,7 +504,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_SIGNING_IDENTITY is written to GITHUB_ENV only when a complete
+          # Apple signing configuration was detected above. Leaving it out here
+          # is essential: an empty variable makes Tauri call codesign with "".
           # Notarization credentials are NOT wired in here: passing unset secrets
           # injects empty strings, which Tauri reads as "present" and tries to
           # notarize with blank creds. The "Configure Apple notarization" step
