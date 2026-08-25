@@ -353,7 +353,8 @@ jobs:
           );
           NODE
 
-      - name: Validate Apple signing secrets
+      - name: Inspect Apple signing configuration
+        id: apple_signing
         if: matrix.name == 'macos'
         shell: bash
         env:
@@ -368,34 +369,44 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          missing=0
-          require() {
-            if [ -z "${!1:-}" ]; then
-              echo "::error::$1 is required for a signed and notarized macOS release."
-              missing=1
+          signing_values="$APPLE_CERTIFICATE$APPLE_CERTIFICATE_PASSWORD$APPLE_SIGNING_IDENTITY"
+          if [ -n "$signing_values" ]; then
+            missing=0
+            for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
+              if [ -z "${!name:-}" ]; then
+                echo "::error::$name is required when macOS code signing is configured."
+                missing=1
+              fi
+            done
+            if [ "$missing" -ne 0 ]; then
+              exit 1
             fi
-          }
-
-          require APPLE_CERTIFICATE
-          require APPLE_CERTIFICATE_PASSWORD
-          require APPLE_SIGNING_IDENTITY
-
-          # Notarization is optional. A free self-signed release is code-signed
-          # (so Accessibility survives updates) but cannot be notarized. Only
-          # validate notarization credentials when some were actually provided.
-          if [ -n "$APPLE_API_KEY_PRIVATE_KEY$APPLE_API_KEY_ID$APPLE_API_ISSUER" ]; then
-            require APPLE_API_KEY_PRIVATE_KEY
-            require APPLE_API_KEY_ID
-            require APPLE_API_ISSUER
-          elif [ -n "$APPLE_ID$APPLE_PASSWORD$APPLE_TEAM_ID" ]; then
-            require APPLE_ID
-            require APPLE_PASSWORD
-            require APPLE_TEAM_ID
+            echo "configured=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::No Apple notarization credentials set; the macOS build will be signed but NOT notarized (Gatekeeper warns on first open unless installed via the Homebrew cask)."
+            # Tauri updater signatures remain mandatory and are independent of
+            # Apple code signing. This fallback lets a project without a paid
+            # Apple certificate publish a valid in-app updater artifact.
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No Apple code-signing identity is configured; publishing an unsigned, non-notarized macOS bundle."
           fi
 
-          exit "$missing"
+          # Notarization is optional. Only validate a credential set when the
+          # repository actually supplies part of that set.
+          if [ -n "$APPLE_API_KEY_PRIVATE_KEY$APPLE_API_KEY_ID$APPLE_API_ISSUER" ]; then
+            for name in APPLE_API_KEY_PRIVATE_KEY APPLE_API_KEY_ID APPLE_API_ISSUER; do
+              if [ -z "${!name:-}" ]; then
+                echo "::error::$name is required when App Store Connect notarization is configured."
+                exit 1
+              fi
+            done
+          elif [ -n "$APPLE_ID$APPLE_PASSWORD$APPLE_TEAM_ID" ]; then
+            for name in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+              if [ -z "${!name:-}" ]; then
+                echo "::error::$name is required when Apple ID notarization is configured."
+                exit 1
+              fi
+            done
+          fi
 
       - name: Configure Apple notarization
         if: matrix.name == 'macos'
@@ -442,7 +453,7 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
       - name: Set up self-signed signing keychain
-        if: matrix.name == 'macos'
+        if: matrix.name == 'macos' && steps.apple_signing.outputs.configured == 'true'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -520,6 +531,7 @@ jobs:
         if: matrix.name == 'macos'
         shell: bash
         env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
         run: |
@@ -544,18 +556,20 @@ jobs:
             exit 1
           fi
 
-          # The signature itself must always be valid.
-          codesign --verify --deep --strict --verbose=2 "$app_path"
-          codesign --verify --verbose=2 "$dmg_path"
-
-          # spctl asserts Gatekeeper acceptance, which only holds for notarized
-          # builds. A free self-signed release is expected to fail it, so only
-          # run it when notarization credentials were provided.
-          if [ -n "${APPLE_API_KEY_ID:-}${APPLE_ID:-}" ]; then
-            spctl -a -t exec -vv "$app_path"
-            spctl -a -t open --context context:primary-signature -vv "$dmg_path"
+          # The updater signature is always required. Apple code-signature and
+          # Gatekeeper checks are only meaningful when a signing identity was
+          # configured for this release.
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            codesign --verify --deep --strict --verbose=2 "$app_path"
+            codesign --verify --verbose=2 "$dmg_path"
+            if [ -n "${APPLE_API_KEY_ID:-}${APPLE_ID:-}" ]; then
+              spctl -a -t exec -vv "$app_path"
+              spctl -a -t open --context context:primary-signature -vv "$dmg_path"
+            else
+              echo "Self-signed (non-notarized) build: skipping spctl Gatekeeper checks."
+            fi
           else
-            echo "Self-signed (non-notarized) build: skipping spctl Gatekeeper checks."
+            echo "Unsigned macOS fallback: skipping Apple code-signature and Gatekeeper checks."
           fi
 
   assemble-latest-json:
