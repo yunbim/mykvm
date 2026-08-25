@@ -3956,8 +3956,8 @@ mod macos_scroll {
             // through the smoother queue was the regression that broke Win->Mac
             // wheel after the mos-like feature landed.
             super::post_smoothed_units(
-                notches_to_pixels(notch_x) as i32,
-                notches_to_pixels(notch_y) as i32,
+                pixels_to_event_units(notches_to_pixels(notch_x)),
+                pixels_to_event_units(notches_to_pixels(notch_y)),
             );
         } else {
             super::post_line_scroll(notch_x.round() as i32, notch_y.round() as i32);
@@ -3984,6 +3984,24 @@ mod macos_scroll {
             y *= factor;
         }
         (x, y)
+    }
+
+    /// Converts an already-cooked pixel delta to the integer payload accepted by
+    /// CGEvent. Remote scroll bypasses the worker (so it cannot use the worker's
+    /// fractional carry); rounding alone would still turn a small nonzero delta
+    /// into zero, which makes a valid wheel tick appear unresponsive when users
+    /// choose a sub-pixel tuning value. Preserve direction and guarantee one
+    /// event unit for every nonzero remote delta.
+    fn pixels_to_event_units(pixels: f64) -> i32 {
+        if pixels == 0.0 {
+            return 0;
+        }
+        let rounded = pixels.round();
+        if rounded == 0.0 {
+            pixels.signum() as i32
+        } else {
+            rounded as i32
+        }
     }
 
     /// Notches to pixels using the live tuning, preserving the "a fraction of a
@@ -4223,6 +4241,15 @@ mod macos_scroll {
             REVERSE.store(true, Ordering::Relaxed);
             // Vertical 1 -> horizontal 1 -> reversed -> tripled.
             assert_eq!(transform(0.0, 1.0, FLAG_SHIFT | FLAG_ALTERNATE), (-3.0, 0.0));
+        }
+
+        #[test]
+        fn remote_pixel_conversion_never_drops_nonzero_scroll() {
+            assert_eq!(pixels_to_event_units(0.0), 0);
+            assert_eq!(pixels_to_event_units(0.49), 1);
+            assert_eq!(pixels_to_event_units(-0.49), -1);
+            assert_eq!(pixels_to_event_units(1.49), 1);
+            assert_eq!(pixels_to_event_units(-1.51), -2);
         }
 
         #[test]
